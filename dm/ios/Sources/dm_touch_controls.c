@@ -4,9 +4,7 @@
 #include <string.h>
 
 #include <stdatomic.h>
-#define DM_TC_POINTER_MOVE_PT 10.0f
 #define DM_TC_POINTER_HOLD_S 0.5
-#define DM_TC_POINTER_TAP_S 0.35
 
 /* 控件缩放。手机（画面高 ≤ 440 点，最大的 iPhone 横屏就是 440）：min(1, 宽/667, 高/375)，与原来一字不差。
    比手机高的画面（iPad 上居中的 16:9 那块，13 寸是 1366×768 点）：按画面高度等比放大（高/440），否则摇杆与技能钮还是手机的点数大小，
@@ -28,6 +26,18 @@ static float scale_for(const dm_tc_layout *l) { return dm_tc_scale_for_size(l->w
    Safe area (in iPhone landscape there is a strip on each of the left and right yielded to the Dynamic Island / rounded corners; read as 62 points each on a 17 Pro Max): the whole right-side skill key group and the left stick are translated by the minimum displacement so that they lie entirely inside the safe area,
       with the relative arrangement within the group unchanged. Which side the island is on depends on how the player holds the device, so both sides are inset. Default 0 (Mac host and unit tests do not set it = original layout). */
 static float g_safe_l, g_safe_r;
+typedef struct { int set, visible; float nx, ny; } dm_tc_key_override;
+static dm_tc_key_override g_key_override[DM_TC_SKILL4 + 1];
+
+void dm_tc_clear_key_position_overrides(void) { memset(g_key_override,0,sizeof(g_key_override)); }
+void dm_tc_set_key_position_override(int target, float nx, float ny, int visible) {
+    if (target < DM_TC_MAIN || target > DM_TC_SKILL4 || !isfinite(nx) || !isfinite(ny)) return;
+    g_key_override[target]=(dm_tc_key_override){1,visible!=0,fminf(1,fmaxf(0,nx)),fminf(1,fmaxf(0,ny))};
+}
+int dm_tc_get_key_position_override(int target, float *nx, float *ny, int *visible) {
+    if (target < DM_TC_MAIN || target > DM_TC_SKILL4 || !g_key_override[target].set) return 0;
+    if(nx) *nx=g_key_override[target].nx; if(ny) *ny=g_key_override[target].ny; if(visible) *visible=g_key_override[target].visible; return 1;
+}
 /* 屏幕底边归系统的那一条（点）：从这里起手往上划会被系统当成底边手势（iPad 上连着两次就拉出程序坞），而移动恰好是同一处反复起手往上推。
    这一条里起手不当摇杆、松手也不当点地；从上面起手的摇杆拖进来照常持有。只有 iPad 的前端会给非零值，手机恒为 0。
    The strip along the bottom edge of the screen that belongs to the system (points): a swipe up starting here is taken by the system as a bottom-edge gesture (on iPad two in a row pull out the Dock), and movement is exactly a repeated push upward starting from the same place.
@@ -42,14 +52,14 @@ void dm_tc_layout_make(dm_tc_layout *l, float width, float height) {
     l->height = isfinite(height) && height > 0 ? height : 0;
     float k = scale_for(l);
     float main_x = l->width - 56 * k, main_y = l->height - 82 * k;
-    { float over = main_x + 40*k - (l->width - g_safe_r); if (over > 0) main_x -= over; }   /* 右侧一组里最靠右的是主技能键（半径 40） | The rightmost one in the right-side group is the main skill key (radius 40) */
-    l->target[DM_TC_MAIN] = (dm_tc_target){ main_x, main_y, 40*k, DM_BTN_A };
+    { float over = main_x + DM_TC_MAIN_RADIUS*k - (l->width - g_safe_r); if (over > 0) main_x -= over; }   /* 右侧一组里最靠右的是主攻击键（半径 48） | The rightmost one in the right-side group is the main attack key (radius 48) */
+    l->target[DM_TC_MAIN] = (dm_tc_target){ main_x, main_y, DM_TC_MAIN_RADIUS*k, DM_BTN_A, 0 };
     /* 四分之一弧的单位向量：180°、150°、120°、90°。 | Unit vectors of the quarter arc: 180°, 150°, 120°, 90°. */
     const float dx[4] = {-1, -0.8660254038f, -0.5f, 0};
     const float dy[4] = {0, -0.5f, -0.8660254038f, -1};
     const uint64_t skill[4] = {DM_BTN_B, DM_BTN_X, DM_BTN_Y, DM_BTN_R};
     for (int i = 0; i < 4; ++i)
-        l->target[DM_TC_SKILL1+i] = (dm_tc_target){main_x+112*k*dx[i], main_y+112*k*dy[i], 26*k, skill[i]};
+        l->target[DM_TC_SKILL1+i] = (dm_tc_target){main_x+112*k*dx[i], main_y+112*k*dy[i], 26*k, skill[i], 0};
     /* 底栏 = 底部 UI v4 六格（NativeHUD/v4，游戏 HUD 按屏高缩放、以屏幕中线居中，所以按屏高换算）：
        效果图 2868×1320 里格心 x = 1090 + 120×格号、y = 1241.5、格宽 114；第 0 格难度，1–4 腰带四列，5 功能入口（PLUS）。
        回城不在底栏（离药水太近易误触）：改为技能弧最上面那颗（技能四）正上方的圆钮，同半径、间距 12，点下由宿主施放原版回城技能（dm_freetp.c），不出按键。
@@ -61,12 +71,12 @@ void dm_tc_layout_make(dm_tc_layout *l, float width, float height) {
     const int cell[5] = {1, 2, 3, 4, 5};
     float u = l->height / 1320.0f;
     for (int i = 0; i < 5; ++i)
-        l->target[DM_TC_BELT1+i] = (dm_tc_target){l->width/2+(1090+120*cell[i]-1434)*u, 1241.5f*u, 57*u, bottom[i]};
-    { const dm_tc_target *s4 = &l->target[DM_TC_SKILL4]; l->target[DM_TC_PORTAL] = (dm_tc_target){s4->x, s4->y-s4->r-12*k-26*k, 26*k, 0}; }
+        l->target[DM_TC_BELT1+i] = (dm_tc_target){l->width/2+(1090+120*cell[i]-1434)*u, 1241.5f*u, 57*u, bottom[i], 0};
+    { const dm_tc_target *s4 = &l->target[DM_TC_SKILL4]; l->target[DM_TC_PORTAL] = (dm_tc_target){s4->x, s4->y-s4->r-12*k-26*k, 26*k, 0, 0}; }
     /* 第 0 格难度与选择条：选择条 8 格同格宽、格距 120，中线对齐两球中线（效果图 1390），格心 y = 1051.5（七格之上、避开数值文字） | Cell 0 difficulty and the selector bar: the selector bar has 8 cells of the same cell width, cell pitch 120, centerline aligned with the centerline between the two orbs (mock 1390), cell center y = 1051.5 (above the seven cells, clear of the value text) */
-    l->diff = (dm_tc_target){l->width/2+(1090-1434)*u, 1241.5f*u, 57*u, 0};
-    for (int i = 0; i < 8; ++i) l->pick[i] = (dm_tc_target){l->width/2+(1390+(i-3.5f)*120-1434)*u, 1051.5f*u, 57*u, 0};
-    l->target[DM_TC_MAP] = (dm_tc_target){l->width-30*k, 30*k, 22*k, DM_BTN_MINUS};
+    l->diff = (dm_tc_target){l->width/2+(1090-1434)*u, 1241.5f*u, 57*u, 0, 0};
+    for (int i = 0; i < 8; ++i) l->pick[i] = (dm_tc_target){l->width/2+(1390+(i-3.5f)*120-1434)*u, 1051.5f*u, 57*u, 0, 0};
+    l->target[DM_TC_MAP] = (dm_tc_target){l->width-30*k, 30*k, 22*k, DM_BTN_MINUS, 0};
     /* 技能组切换：主技能左下、技能一下方，避开主技能与弧上四键 | Skill set switch: lower-left of the main skill, below skill one, clear of the main skill and the four keys on the arc */
     /* 位置与大小：技能一正下方，半径 22（直径 44 点 ≈ 7.3 毫米）；上沿离技能一下沿 4 点、下沿离屏幕底 10 点（956×440） | Position and size: directly below skill one, radius 22 (diameter 44 points ≈ 7.3 mm); top edge 4 points from the bottom edge of skill one, bottom edge 10 points from the bottom of the screen (956×440) */
     /* 比手机窄的画面（16:9：iPad 留边 / 真全屏的游戏视图、667×375）底栏按屏高缩放、右端雕像翼尖（效果图 x 2075）会伸到换组键底下：
@@ -74,7 +84,12 @@ void dm_tc_layout_make(dm_tc_layout *l, float width, float height) {
        On pictures narrower than the phone's (16:9: iPad letterboxed / true full-screen game view, 667×375) the bottom bar scales by screen height and the right-end statue wing tip (mock x 2075) would extend under the set-switch key:
               the key moves right to at least 8 points away from the wing tip, size unchanged (measured: at 1366×768 the original position overlaps by 21 points; at 956×440 it is already 28 points apart and is not moved) */
     { float sx = main_x-112*k, bar_r = l->width/2+(2015-1434)*u+8*k+22*k;   /* 右雕像翼尖：七格时 2075，六格石条右端收进 60 | Right statue wing tip: 2075 with seven cells; with six cells the right end of the stone bar is pulled in by 60 */ if (sx < bar_r) sx = bar_r;
-      l->swap = (dm_tc_target){sx, main_y+52*k, 22*k, 0}; }
+      l->swap = (dm_tc_target){sx, main_y+52*k, 22*k, 0, 0}; }
+    for (int i=DM_TC_MAIN; i<=DM_TC_SKILL4; ++i) if (g_key_override[i].set) {
+        dm_tc_key_override o=g_key_override[i]; l->target[i].x=o.nx*l->width; l->target[i].y=o.ny*l->height;
+        l->target[i].manual_empty = !o.visible;
+        /* 空位仍是一个完整的可交互槽位：画圆框 / ➕、命中它，并允许再次绑定或拖动交换。 */
+    }
     /* 底栏外侧是血 / 蓝球；球不是输入目标。 | Outside the bottom bar are the life / mana orbs; the orbs are not input targets. */
     /* 左摇杆是浮动底盘：左下「起摇杆区」里手指落在哪，底盘圆心就落在哪，松手回静止位。
        静止位：圆心离安全区左界 90（底盘半径 60 + 30）、不小于 120，离屏幕底 115——只是没按时画在哪。
@@ -96,14 +111,128 @@ void dm_tc_layout_make(dm_tc_layout *l, float width, float height) {
 int dm_tc_hit(const dm_tc_layout *l, float x, float y) {
     if (!isfinite(x) || !isfinite(y) || x < 0 || y < 0 || x > l->width || y > l->height)
         return DM_TC_NONE;
+    int best = DM_TC_NONE;
+    float best_ratio = INFINITY;
     for (int i = 0; i < DM_TC_COUNT; ++i) {
         const dm_tc_target *t = &l->target[i];
         float dx = x-t->x, dy = y-t->y;
-        if (t->r > 0 && dx*dx+dy*dy <= t->r*t->r) return i;
+        if (t->r > 0 && dx*dx+dy*dy <= t->r*t->r) {
+            float ratio = (dx*dx+dy*dy)/(t->r*t->r);
+            if (ratio < best_ratio) { best_ratio = ratio; best = i; }
+        }
     }
     float sx = x-l->swap.x, sy = y-l->swap.y;
-    if (l->swap.r > 0 && sx*sx+sy*sy <= l->swap.r*l->swap.r) return DM_TC_SWAP;
+    if (l->swap.r > 0 && sx*sx+sy*sy <= l->swap.r*l->swap.r) {
+        float ratio = (sx*sx+sy*sy)/(l->swap.r*l->swap.r);
+        if (ratio < best_ratio) return DM_TC_SWAP;
+    }
+    if (best != DM_TC_NONE) return best;
     return DM_TC_NONE;
+}
+
+int dm_tc_bind_target_at(const dm_tc_layout *l, uint32_t enabled_targets, float x, float y) {
+    int target = dm_tc_hit(l,x,y);
+    if (target < DM_TC_MAIN || target > DM_TC_SKILL4 || !(enabled_targets & (1u << target))) return DM_TC_NONE;
+    return target;
+}
+
+void dm_tc_set_key_position(dm_tc_state *s, int target, float x, float y) {
+    if (!s || target < DM_TC_MAIN || target > DM_TC_SKILL4 || !isfinite(x) || !isfinite(y)) return;
+    float w=s->layout.width,h=s->layout.height; if (!(w>0 && h>0)) return;
+    x=fminf(w,fmaxf(0,x)); y=fminf(h,fmaxf(0,y));
+    dm_tc_set_key_position_override(target,x/w,y/h,1);
+    s->layout.target[target].x=x; s->layout.target[target].y=y; s->layout.target[target].r=(target==DM_TC_MAIN?DM_TC_MAIN_RADIUS:26)*scale_for(&s->layout);
+    s->layout.target[target].manual_empty=0;
+}
+void dm_tc_set_key_empty(dm_tc_state *s, int target, int empty) {
+    if (!s || target < DM_TC_MAIN || target > DM_TC_SKILL4) return;
+    float nx=s->layout.width>0?s->layout.target[target].x/s->layout.width:0, ny=s->layout.height>0?s->layout.target[target].y/s->layout.height:0;
+    dm_tc_set_key_position_override(target,nx,ny,!empty); s->layout.target[target].manual_empty=!!empty;
+    s->layout.target[target].r=(target==DM_TC_MAIN?DM_TC_MAIN_RADIUS:26)*scale_for(&s->layout);
+}
+
+static int skill_target(int target);
+static void update(dm_tc_state *s);
+
+int dm_tc_mark_key_bound(dm_tc_state *s, uint64_t key_mask) {
+    if (!s) return DM_TC_NONE;
+    uint64_t button = key_mask & ~DM_BTN_ZL;
+    for (int target = DM_TC_MAIN; target <= DM_TC_SKILL4; ++target) {
+        if (s->layout.target[target].button != button) continue;
+        if (!s->layout.target[target].manual_empty) return DM_TC_NONE;
+        dm_tc_set_key_empty(s, target, 0);
+        ++s->layout_edit_seq;
+        update(s);
+        return target;
+    }
+    return DM_TC_NONE;
+}
+
+uint64_t dm_tc_take_bind_request(dm_tc_state *s) {
+    if (!s) return 0;
+    uint64_t request = s->bind_request;
+    s->bind_request = 0;
+    return request;
+}
+
+void dm_tc_reset_key_positions(dm_tc_state *s) {
+    if (!s) return;
+    uint64_t portal = s->layout.target[DM_TC_PORTAL].button;
+    float width = s->layout.width, height = s->layout.height;
+    dm_tc_clear_key_position_overrides();
+    dm_tc_cancel_all(s);
+    dm_tc_layout_make(&s->layout, width, height);
+    s->layout.target[DM_TC_PORTAL].button = portal;
+    ++s->layout_edit_seq;
+    update(s);
+}
+
+static int layout_drop_target(const dm_tc_state *s, int source, float x, float y) {
+    for (int i = DM_TC_MAIN; i <= DM_TC_SKILL4; ++i) {
+        if (i == source || !(s->enabled_targets & (1u << i))) continue;
+        const dm_tc_target *t = &s->layout.target[i];
+        if (t->r > 0 && hypotf(x - t->x, y - t->y) <= t->r) return i;
+    }
+    return DM_TC_NONE;
+}
+
+static int layout_maybe_begin(dm_tc_state *s, dm_tc_finger *f) {
+    if (s->navigation_mode || f->layout_editing || !skill_target(f->target)) return 0;
+    if (s->last_time_s - f->start_time_s < DM_TC_LAYOUT_HOLD_S ||
+        hypotf(f->x - f->aim_origin_x, f->y - f->aim_origin_y) <= DM_TC_LAYOUT_DRAG_PT * scale_for(&s->layout)) return 0;
+    f->layout_editing = 1;
+    f->layout_edit_target = f->target;
+    f->layout_preview_x = f->x;
+    f->layout_preview_y = f->y;
+    f->aim_cancelled = 1;
+    f->key_down = 0;
+    return 1;
+}
+
+static int layout_finish(dm_tc_state *s, const dm_tc_finger *f) {
+    int source = f->layout_edit_target;
+    if (source < DM_TC_MAIN || source > DM_TC_SKILL4) return 0;
+    const dm_tc_target old = s->layout.target[source];
+    int dest = layout_drop_target(s, source, f->x, f->y);
+    if (dest == source) return 0;
+    if (dest >= DM_TC_MAIN && dest <= DM_TC_SKILL4) {
+        const dm_tc_target other = s->layout.target[dest];
+        float w=s->layout.width, h=s->layout.height;
+        /* 交换的是两个槽的位置和空/非空状态；不能调用 set_key_position，
+           因为它会无条件把 manual_empty 清掉。 */
+        dm_tc_set_key_position_override(source,other.x/w,other.y/h,!old.manual_empty);
+        dm_tc_set_key_position_override(dest,old.x/w,old.y/h,!other.manual_empty);
+        s->layout.target[source].x=other.x; s->layout.target[source].y=other.y;
+        s->layout.target[source].r=(source==DM_TC_MAIN?DM_TC_MAIN_RADIUS:26)*scale_for(&s->layout);
+        s->layout.target[source].manual_empty=old.manual_empty;
+        s->layout.target[dest].x=old.x; s->layout.target[dest].y=old.y;
+        s->layout.target[dest].r=(dest==DM_TC_MAIN?DM_TC_MAIN_RADIUS:26)*scale_for(&s->layout);
+        s->layout.target[dest].manual_empty=other.manual_empty;
+    } else {
+        dm_tc_set_key_empty(s, source, 1);
+    }
+    ++s->layout_edit_seq;
+    return 1;
 }
 
 static int skill_target(int target) {
@@ -132,7 +261,7 @@ static void update_aim(dm_tc_state *s) {
     uint64_t latest = 0;
     for (int i = 0; i < DM_TC_MAX_TOUCH; ++i) {
         const dm_tc_finger *f = &s->finger[i];
-        if (!f->active || !skill_target(f->target)) continue;
+        if (!f->active || f->layout_editing || !skill_target(f->target)) continue;
         if (inside_map_cancel(s, f)) s->map_cancel_active = 1;
         if (!f->aim_cancelled && f->aim_move_sequence > latest) {
             latest = f->aim_move_sequence;
@@ -154,8 +283,9 @@ static void update(dm_tc_state *s) {
     s->buttons = 0;
     for (int i = 0; i < DM_TC_MAX_TOUCH; ++i) {
         dm_tc_finger *f = &s->finger[i];
-        if (f->active && !f->aim_cancelled && f->target >= 0 && f->target < DM_TC_COUNT) {
-            uint64_t b = f->target==DM_TC_PORTAL && s->portal_pending ? DM_BTN_ZL : s->layout.target[f->target].button;
+        if (f->active && !f->layout_editing && !f->aim_cancelled && f->target >= 0 && f->target < DM_TC_COUNT) {
+            uint64_t b = s->layout.target[f->target].manual_empty ? 0 :
+                         (f->target==DM_TC_PORTAL && s->portal_pending ? DM_BTN_ZL : s->layout.target[f->target].button);
             /* 拖动定方向（核心手势）。技能钮：按下后先等 DM_TC_AIM_SETTLE_S 看是点按还是拖动——拖过死区就带着右轴方向立刻键下，
                没拖到点也键下（点按 = 原版自动选目标 / 朝向）；否则键先下、右轴后偏，按下那一发朝的是旧朝向。
                主钮：按下即键下，不等（它是最高频的键，点按不该多等；按下就拖的第一发是原生朝向，第二发起跟手）。
@@ -479,7 +609,7 @@ void dm_tc_begin_at(dm_tc_state *s, int slot, float x, float y, double now_s) {
     }
     if (hit == DM_TC_SWAP) {
         if (s->navigation_mode) hit = DM_TC_NONE;
-        else { s->skill_set = !s->skill_set; *f = (dm_tc_finger){.active=1, .target=DM_TC_SWAP, .x=x, .y=y}; update(s); return; }
+        else { s->skill_set = !s->skill_set; *f = (dm_tc_finger){.active=1, .target=DM_TC_SWAP, .x=x, .y=y, .aim_origin_x=x, .aim_origin_y=y, .start_time_s=now_s}; update(s); return; }
     }
     int enabled = hit >= 0 && (s->enabled_targets & (1u << hit));
     /* 面板态：被禁用的目标（底栏腰带 / 功能键 / 回城、圆钮收起后的技能钮位置）不占手指——它们压着的地方可能正是面板的按钮
@@ -536,7 +666,19 @@ void dm_tc_move_at(dm_tc_state *s, int slot, float x, float y, double now_s) {
     dm_tc_finger *f = &s->finger[slot];
     f->x = x;
     f->y = y;
-    if (pointer_finger(s, f)) {
+    if (f->layout_editing) {
+        f->layout_preview_x = x;
+        f->layout_preview_y = y;
+    } else if (!s->navigation_mode && skill_target(f->target)) {
+        (void)layout_maybe_begin(s, f);
+        if (f->layout_editing) {
+            f->layout_preview_x = x;
+            f->layout_preview_y = y;
+        } else {
+            if (inside_map_cancel(s, f)) f->aim_cancelled = 1;
+            if (!f->aim_cancelled) f->aim_move_sequence = ++s->aim_move_sequence;
+        }
+    } else if (pointer_finger(s, f)) {
         float distance = hypotf(f->x-f->aim_origin_x, f->y-f->aim_origin_y);
         if (!f->pointer_dragged && distance > DM_TC_POINTER_MOVE_PT * scale_for(&s->layout) && (!s->mouse_click_mode || s->pointer_item == 1))
             pointer_drag_begin(s, f);   /* 鼠标点击模式：只有从物品区起手才是拖放；别处的滑动不发键。按住不动超过长按时长再拖也算拖放（真人「按住停一下再拖」，z4：0.5 秒后才动的拖放拿不起来） | Mouse click mode: only a gesture starting in the item area is a drag-and-drop; swipes elsewhere send no key. Holding still longer than the long-press duration and then dragging also counts as drag-and-drop (a real person "holds for a moment and then drags"; z4: a drag that started moving only after 0.5 seconds could not pick the item up) */
@@ -544,9 +686,6 @@ void dm_tc_move_at(dm_tc_state *s, int slot, float x, float y, double now_s) {
         else if (s->mouse_click_mode && s->pointer_item != 1 && s->pointer_item != 3 && s->pointer_item != 6 && !f->ui_drag && !f->pointer_dragged && distance > DM_TC_POINTER_MOVE_PT * scale_for(&s->layout))
             f->ui_drag = fabsf(f->x - f->aim_origin_x) > fabsf(f->y - f->aim_origin_y) ? 2 : 1;   /* 界面连续手势：过阈值那一刻按方向定型（纵 = 滚动，横 = 滑块） | Continuous UI gesture: the type is fixed by direction at the moment the threshold is crossed (vertical = scroll, horizontal = slider) */
         update_pointer(s);
-    } else if (!s->navigation_mode && skill_target(f->target)) {
-        if (inside_map_cancel(s, f)) f->aim_cancelled = 1;
-        if (!f->aim_cancelled) f->aim_move_sequence = ++s->aim_move_sequence;
     }
     update(s);
 }
@@ -560,6 +699,32 @@ void dm_tc_end_at(dm_tc_state *s, int slot, double now_s) {
         dm_tc_cancel_portal(s);return;
     }
     dm_tc_finger done = s->finger[slot];
+    if (done.target == DM_TC_SWAP) {
+        double elapsed = now_s - done.start_time_s;
+        float distance = hypotf(done.x - done.aim_origin_x, done.y - done.aim_origin_y);
+        if (elapsed >= DM_TC_LAYOUT_HOLD_S && distance <= DM_TC_LAYOUT_DRAG_PT * scale_for(&s->layout)) {
+            dm_tc_reset_key_positions(s);
+            return;
+        }
+        s->finger[slot] = (dm_tc_finger){.target=DM_TC_NONE};
+        update(s);
+        return;
+    }
+    if (done.layout_editing) {
+        (void)layout_finish(s, &done);
+        s->finger[slot] = (dm_tc_finger){.target=DM_TC_NONE};
+        update(s);
+        return;
+    }
+    /* 空槽不是游戏内的一次施放：短点在结束触摸这一刻只生成一条绑定请求，
+       由前端取走并让宿主打开技能树。这里使用宽容的独立阈值；战斗技能仍使用
+       更短的点按阈值。请求只能保留一个，因为原生绑定框一次只接受一个目标键。 */
+    if (!s->navigation_mode && !s->bind_request && skill_target(done.target) &&
+        s->layout.target[done.target].manual_empty &&
+        now_s - done.start_time_s <= DM_TC_EMPTY_SLOT_TAP_S &&
+        hypotf(done.x - done.aim_origin_x, done.y - done.aim_origin_y) <= DM_TC_EMPTY_SLOT_MOVE_PT * scale_for(&s->layout)) {
+        s->bind_request = s->layout.target[done.target].button | (s->skill_set ? DM_BTN_ZL : 0);
+    }
     if (s->navigation_mode && slot == s->pointer_slot) {
         float distance = hypotf(done.x-done.aim_origin_x, done.y-done.aim_origin_y);
         double elapsed = now_s - done.start_time_s;
@@ -628,7 +793,7 @@ void dm_tc_end_at(dm_tc_state *s, int slot, double now_s) {
        Skill button: hold = continuous cast, drag sets the direction, release lifts the key; no longer "hold to aim, release to cast once".
               The only thing to make up: the tap was too short and the finger lifted before the key could go down (shorter than the tap / drag decision time, or in the second set ZL has not led long enough) -- make it up as one pulse with direction;
               in the second set, when ZL has not led long enough, this pulse is delayed until it has (dm_tc_tick). */
-    if (done.active && done.target >= DM_TC_SKILL1 && done.target <= DM_TC_SKILL4 && !done.aim_cancelled && !s->navigation_mode
+    if (done.active && done.target >= DM_TC_SKILL1 && done.target <= DM_TC_SKILL4 && !s->layout.target[done.target].manual_empty && !done.aim_cancelled && !s->navigation_mode
         && (!done.key_down || now_s - done.key_down_s < DM_TC_KEY_MIN_S || (s->skill_set && now_s - done.start_time_s < DM_TC_ZL_LEAD_S))) {   /* 键没按下过，或按下不到 2 帧（游戏可能漏读）：补成脉冲 | The key was never pressed, or was pressed for less than 2 frames (the game may miss it): make it up as a pulse */
         float ux = 0, uy = 0; int has = aim_dir(s, &done, &ux, &uy);
         s->pulse_rx = has ? (int32_t)lroundf(ux*DM_STICK_MAX) : 0; s->pulse_ry = has ? (int32_t)lroundf(-uy*DM_STICK_MAX) : 0;
@@ -712,4 +877,3 @@ int dm_tc_navigation(dm_tc_scene *s, const char *cat, const char *act, const cha
 /* 死亡弹窗开着：也算导航态（触点走界面点击，能点到「继续」），但五个手柄圆钮不给——死后点技能钮位置会触发复活，容易误触 | Death popup open: also counts as navigation state (touch points go through UI clicks, so 「继续」(Continue) can be tapped), but the five controller round buttons are not offered -- after death a tap at a skill button position triggers resurrection, which is easy to hit by mistake */
 int dm_tc_scene_dead(void) { return atomic_load(&g_dead_modal); }
 int dm_tc_scene_dialog_only(const dm_tc_scene *s) { return s->game && s->panels == (1ull << 9); }   /* 面板表第 9 项 = NpcDialogPanel（见 dm_tc_navigation 的 names） | Entry 9 of the panel table = NpcDialogPanel (see names in dm_tc_navigation) */
-

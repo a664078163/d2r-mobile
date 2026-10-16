@@ -106,6 +106,7 @@ int dm_ui_minimap_rect(float r[4]);
 // the player taps a skill (while the flow is in progress the front end turns the tap into 'cursor to the point + press Y') -> the original game's 「重新绑定技能」(Press button to rebind skill) box pops up -> the host presses the target key for the player -> the panel closes. dm_ui_bind_active() = flow in progress (0 none / 1 opening the skill tree / 2 waiting for the player to tap a skill / 3 wrapping up)
 void dm_ui_bind_begin(uint64_t key_mask);
 int dm_ui_bind_slot(void);   /* 绑定目标位 1..8（F1–F8），不在绑定态 0 | Binding target slot 1..8 (F1–F8), 0 when not in the binding state */
+uint64_t dm_ui_bind_take_completed(void);   /* successful touch-initiated binding, once; 0 otherwise */
 void dm_ui_safe_left(int units);    /* 左安全区，布局单位（2160 高）；左上角佣兵 / 队友头像栏按它内移 | Left safe area, in layout units (2160 high); the mercenary / party member portrait bar in the top-left corner is moved inward by it */
 void dm_ui_safe_right(int units);   /* 右安全区，布局单位（2160 高）；右上角小地图与信息栏按它内移 | Right safe area, in layout units (2160 high); the minimap and info bar in the top-right corner are moved inward by it */
 uint32_t dm_ui_hit_id(void);   /* 最近一次命中的加点类按钮：属性「+」1..4（力量 / 敏捷 / 体力 / 精力），技能图标 = 最高位置 1 的标识；没命中 0 | The most recently hit point-spending button: attribute '+' 1..4 (strength / dexterity / vitality / energy), skill icon = an identifier with the top bit set to 1; 0 if nothing was hit */

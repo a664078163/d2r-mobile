@@ -73,6 +73,8 @@ static BOOL touch_control_log_enabled(void) {
 - (void)restartCover:(int)mode;
 - (void)captureTouchLayer:(NSString *)path;
 - (void)refreshPortalBinding;
+- (void)restoreTouchLayout;
+- (void)persistTouchLayout;
 @end
 static __weak DmMetalView *g_touch_view;
 // 真全屏（屏幕比 16:9 窄，iPad 4:3）：3D 铺满整窗，游戏视图（界面、自绘控件、界面触点）是贴底的一块 16:9，见 front_ios_view。
@@ -135,20 +137,48 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     uint64_t _modifierPublishEndNS,_modifierPublishEpoch;
     uint64_t _touchEventSeq,_touchReceiptSeq,_touchPublishedEventSeq; // 仅 DM_TOUCH_CONTROL_LOG 开启时推进 | Advanced only when DM_TOUCH_CONTROL_LOG is on
     UITouch *_pendEnd; double _pendEndTime,_pendWall; BOOL _pendFire,_finalAsked;   // 松手了但宿主的答案还没回：这根手指的「抬起」先挂着（见 finishTouches） | Released but the host's answer is not back yet: this finger's "lift" is held pending (see finishTouches)
-    int32_t _minLeft,_maxLeft; uint64_t _lastButtons; unsigned _touchAPresses,_touchShots; UITouch *_uiFinger; CGPoint _uiFeO; BOOL _uiFeDrag; BOOL _uiDragOn; UITouch *_mapTouch, *_mapBackTouch, *_bindTouch; UIView *_ghostDim; BOOL _ghostOn; uint64_t _bindKey; uint32_t _selId; double _statNext; double _tipUntil, _addAt; unsigned _mapWorldSeq; BOOL _mapWorldAsked; CGPoint _mapWorldPt; CGPoint _mapP0, _bindP0; double _mapT0; BOOL _pulseTicking; uint64_t _pulseEpoch,_pulseS0; double _pulseT0,_pulseSeen,_pulseFree; unsigned _itemSeq,_relSeq; BOOL _relAsked,_itemAsked; int _itemKind;
+    int32_t _minLeft,_maxLeft; uint64_t _lastButtons; unsigned _touchAPresses,_touchShots; UITouch *_uiFinger; CGPoint _uiFeO; BOOL _uiFeDrag; BOOL _uiDragOn; UITouch *_mapTouch, *_mapBackTouch, *_bindTouch; UIView *_ghostDim; BOOL _ghostOn; uint64_t _bindKey; uint32_t _selId; double _statNext; double _tipUntil, _addAt; unsigned _mapWorldSeq; BOOL _mapWorldAsked; CGPoint _mapWorldPt; CGPoint _mapP0, _bindP0; double _mapT0; BOOL _pulseTicking; uint64_t _pulseEpoch,_pulseS0; double _pulseT0,_pulseSeen,_pulseFree; unsigned _itemSeq,_relSeq; BOOL _relAsked,_itemAsked; int _itemKind; uint64_t _layoutEditSeq;
 }
 + (Class)layerClass { return CAMetalLayer.class; }
 - (instancetype)initWithFrame:(CGRect)f {
     if (!(self = [super initWithFrame:f])) return nil;
     self.multipleTouchEnabled = YES;
     self.isAccessibilityElement=YES; self.accessibilityIdentifier=@"dm_touch_surface"; self.accessibilityLabel=SWT("dmA11ySurface");
-    dm_tc_init(&_controls,f.size.width,f.size.height); _controls.mouse_click_mode=1;   // 功能页里非物品区的点按走界面鼠标点击 | Taps outside the item area in function pages go through UI mouse clicks
+    dm_tc_init(&_controls,f.size.width,f.size.height); _controls.mouse_click_mode=1; [self restoreTouchLayout]; _layoutEditSeq=_controls.layout_edit_seq;   // 功能页里非物品区的点按走界面鼠标点击；恢复保存的触摸布局 | Taps outside the item area in function pages go through UI mouse clicks; restore the saved touch layout
     _overlay=[[DmTouchOverlay alloc] initWithFrame:self.bounds]; _overlay.controls=&_controls; _overlay.hidden=YES;   // 启动即前端页面：进局（读取画面撤下）才显示 | Front-end page right at launch: shown only after entering a run (loading screen removed)
     [self addSubview:_overlay]; _info=[[UIView alloc] initWithFrame:self.bounds]; _info.userInteractionEnabled=NO; _info.hidden=YES; [self addSubview:_info]; g_touch_view=self; dm_gamepad_start(pad_mode_changed);
     _rsCover=[[DmSwallowView alloc] initWithFrame:self.bounds]; _rsCover.backgroundColor=UIColor.blackColor; _rsCover.hidden=YES; _rsCover.userInteractionEnabled=YES;   // 开的时候挂到窗口上（restartCover） | Attached to the window when turned on (restartCover)
     { extern void (*g_dm_restart_cover_hook)(int); g_dm_restart_cover_hook=restart_cover_hook; }
     _navigation=0; [self navigationMode:atomic_load(&g_touch_navigation)];
     return self;
+}
+- (void)restoreTouchLayout {
+    NSDictionary *saved=[[NSUserDefaults standardUserDefaults] objectForKey:@"dm_touch_layout_v1"];
+    if (![saved isKindOfClass:NSDictionary.class]) return;
+    NSArray *names=@[@"main",@"skill1",@"skill2",@"skill3",@"skill4"];
+    dm_tc_clear_key_position_overrides(); BOOL any=NO;
+    for (int i=0;i<(int)names.count;i++) {
+        NSDictionary *v=saved[names[i]];
+        NSNumber *x=[v isKindOfClass:NSDictionary.class] ? v[@"x"] : nil;
+        NSNumber *y=[v isKindOfClass:NSDictionary.class] ? v[@"y"] : nil;
+        NSNumber *visible=[v isKindOfClass:NSDictionary.class] ? v[@"visible"] : nil;
+        if (![x isKindOfClass:NSNumber.class] || ![y isKindOfClass:NSNumber.class] || ![visible isKindOfClass:NSNumber.class]) continue;
+        float nx=x.floatValue, ny=y.floatValue;
+        if (!isfinite(nx) || !isfinite(ny) || nx<0 || nx>1 || ny<0 || ny>1) continue;
+        dm_tc_set_key_position_override(DM_TC_MAIN+i,nx,ny,visible.boolValue); any=YES;
+    }
+    if (any) dm_tc_resize(&_controls,self.bounds.size.width,self.bounds.size.height);
+}
+- (void)persistTouchLayout {
+    NSMutableDictionary *saved=[NSMutableDictionary dictionary];
+    NSArray *names=@[@"main",@"skill1",@"skill2",@"skill3",@"skill4"];
+    for (int i=0;i<(int)names.count;i++) {
+        float x=0,y=0; int visible=0;
+        if (dm_tc_get_key_position_override(DM_TC_MAIN+i,&x,&y,&visible)) saved[names[i]]=@{ @"x":@(x), @"y":@(y), @"visible":@(visible!=0) };
+    }
+    NSUserDefaults *defaults=[NSUserDefaults standardUserDefaults];
+    if (saved.count) [defaults setObject:saved forKey:@"dm_touch_layout_v1"]; else [defaults removeObjectForKey:@"dm_touch_layout_v1"];
+    [defaults synchronize];
 }
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
 - (void)layoutSubviews {
@@ -264,21 +294,18 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     if(_uiDragOn) { _uiDragOn=NO; dm_ui_drag_end(); }
     _mapTouch=_mapBackTouch=_bindTouch=nil;
 }
-// 技能绑定入口（技能为空时一个单色十字，点击进入绑定技能）：游戏态下触点落在技能钮（主攻击大钮 A 与 F1–F4，含当前组）上——
+// 技能绑定入口（技能为空时一个单色十字，点击进入绑定技能）：游戏态下触点落在主攻击钮或技能钮（F1–F4，含当前组）上——
 //   空位：这根手指不进手势层，点一下 = 给这个位选技能（dm_ui_bind_begin，宿主开技能树）；
-//   已绑定：照常进手势层（按下瞄准、松手施放、拖拽定方向）；按住不动超过 0.5 秒且位移 ≤ 10 点 = 长按换绑，取消这次施放（tickTouchControls 里判）。攻击键按住是连续攻击，不做长按。
-// 返回这个点命中的技能钮要绑的手柄键（第二组带 ZL），没命中返回 0；*empty = 该位当前是空的。
-// 主攻击大钮（DM_TC_MAIN，A 键）也在内（复现：主技能置空后点它的「＋」弹不出选技能——原先这里只认 F1–F4，主钮空着时这一下进了手势层当攻击按下去）；
-// 宿主的绑定流程本来就认 A（绑定框第 1 列 = A = 主技能，dm_cursor.c ui_bind_modal_tap）。长按换绑只给 F1–F4（攻击键按住是连续攻击），这里只管「空位点一下」
-// Skill binding entry (a monochrome cross when the skill is empty; tap to bind a skill): in game state, a touch landing on a skill button (main attack button A and F1–F4, including the current set):
-//   Empty slot: this finger does not enter the gesture layer; a tap = choose a skill for this slot (dm_ui_bind_begin, the host opens the skill tree);
-//   Bound: enters the gesture layer as usual (press to aim, release to cast, drag to set direction); holding still for over 0.5 seconds with movement ≤ 10 points = long-press rebind, cancelling this cast (decided in tickTouchControls). Holding the attack key is continuous attack, so it has no long press.
-// Returns the gamepad key to bind for the skill button hit by this point (second set includes ZL), 0 if none hit; *empty = the slot is currently empty.
-// The main attack button (DM_TC_MAIN, A key) is included too (repro: after clearing the main skill, tapping its "+" did not bring up skill selection; this used to accept only F1–F4, so with the main button empty the tap entered the gesture layer as an attack press);
-// the host binding flow already accepts A (binding dialog column 1 = A = main skill, dm_cursor.c ui_bind_modal_tap). Long-press rebind is only for F1–F4 (holding the attack key is continuous attack); this only handles "tap on an empty slot"
+//   已绑定：照常进手势层（按下瞄准、松手施放、拖拽定方向）；按住不动超过 0.5 秒且位移 ≤ 10 点 = 长按换绑，取消这次施放（tickTouchControls 里判）。攻击键按住是连续攻击，不做长按。主攻击钮为空时例外：点按进入绑定，不发送空的 A 键。
+// 返回这个点命中的主攻击钮或技能钮要绑的手柄键（第二组带 ZL），没命中返回 0；*empty = 该位当前是空的
+// Skill binding entry (a single-color cross when the skill is empty; tap to bind a skill): in game mode a touch point lands on the main attack button or a skill button (F1–F4, including the current set) --
+//   empty slot: this finger does not enter the gesture layer, and one tap = choose a skill for this slot (dm_ui_bind_begin, the host opens the skill tree);
+//   bound: enters the gesture layer as usual (press to aim, release to cast, drag to set direction); held still over 0.5 seconds with displacement ≤ 10 points = long press to rebind, cancelling this cast (judged in tickTouchControls). Holding the attack button is continuous attack, with no long press. An empty main attack button is the exception: a tap enters binding and does not send an empty A key.
+// Returns the controller key to bind for the main attack or skill button hit by this point (the second set carries ZL), or 0 if none is hit; *empty = this slot is currently empty
 - (uint64_t)skillKeyAt:(CGPoint)p empty:(BOOL *)empty {
-    int i=dm_tc_hit(&_controls.layout,(float)p.x,(float)p.y);   // 与手势层同一个命中判定 | Same hit test as the gesture layer
-    if((i==DM_TC_MAIN || (i>=DM_TC_SKILL1 && i<=DM_TC_SKILL4)) && (_controls.enabled_targets&(1u<<i))) { const dm_tc_target *t=&_controls.layout.target[i];
+    if(empty) *empty=NO;
+    int i=dm_tc_bind_target_at(&_controls.layout,_controls.enabled_targets,(float)p.x,(float)p.y);   // 主攻击钮和四个技能钮共用绑定命中判定 | The main attack button and four skill buttons share one binding hit test
+    if(i!=DM_TC_NONE) { const dm_tc_target *t=&_controls.layout.target[i];
         dm_tg_snapshot n=_overlay.nativeMapping; uint64_t now_ns(void);
         dm_ta_glyph g=dm_ta_current_set(&n,t->button,now_ns(),_controls.skill_set); *empty=g.status==DM_TA_EMPTY;   // 与画十字用同一份读数（DmTouchOverlay） | Same reading as used for drawing the cross (DmTouchOverlay)
         return t->button|(_controls.skill_set?DM_BTN_ZL:0); }
@@ -434,6 +461,14 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     }
     [self bindTapSync];
     [self shopGhostSync];
+    uint64_t boundKey=dm_ui_bind_take_completed();
+    if (boundKey) {
+        int target=dm_tc_mark_key_bound(&_controls,boundKey);
+        if (target!=DM_TC_NONE) {
+            _layoutEditSeq=_controls.layout_edit_seq; [self persistTouchLayout];
+            LOG("前端：技能已绑到键 %#llx → 恢复触摸槽 %d",(unsigned long long)boundKey,target);
+        }
+    }
     // 按住技能钮不再是换绑（按住技能本来就是持续施放）；换绑只从技能出发（技能树里选），空位十字点一下进技能树保留
     // 属性页按住「+」不放 = 连续加点（约每 0.15 秒 1 点，松手即停）
     // Holding a skill button is no longer rebinding (holding a skill is continuous casting anyway); rebinding only starts from the skill (chosen in the skill tree); tapping the cross on an empty slot to enter the skill tree is kept
@@ -466,6 +501,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
         CGSize z=self.bounds.size; _controls.pointer_valid=1; _controls.pointer_x=0.02f*(float)z.width; _controls.pointer_y=0.5f*(float)z.height; _tipUntil=0; }   // 选中的标识留着：看完说明（框已收）再点同一个仍是加点 | The selected ID is kept: after reading the tooltip (already closed), tapping the same one again still adds a point
     uint64_t tb=_controls.buttons;
     dm_tc_tick(&_controls, now);
+    if (_controls.layout_edit_seq != _layoutEditSeq) { _layoutEditSeq=_controls.layout_edit_seq; [self persistTouchLayout]; LOG("前端：触摸键位布局已保存（序号 %llu）",(unsigned long long)_layoutEditSeq); }
     { int fg=0; for(int i=0;i<DM_TC_MAX_TOUCH;i++) fg|=_controls.finger[i].active; dm_ui_hand_idle(!fg && !_controls.pulse_button && !dm_tc_pulse_pending(&_controls) && !dm_cursor_pending() && !dm_ui_touch_active()); }   // 手上物品守门：触摸空闲才收手上那件 | Held-item guard: the item in hand is put away only when touch is idle
     if(_controls.buttons!=tb && !_controls.pulse_button) [self pushFrom:"tick" phase:"none"];   // tick 里键位变了（第二组：主钮的键在 ZL 领先够了那一拍补上） | Key state changed in tick (second set: the main button's key is added on the tick when ZL has led long enough)
     else if(_controls.belt_request && !_controls.pulse_button) [self pushFrom:"tick" phase:"none"];   // 腰带上面几排的单击过了双击窗（dm_tc_tick 里定下的 belt_request）：当拍交宿主，不等下一次触摸 | A single tap on the upper belt rows has passed the double-tap window (belt_request decided in dm_tc_tick): hand it to the host within this tick, without waiting for the next touch
@@ -509,7 +545,6 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
         int slot=-1;
         { int ex=0; _controls.belt_rows=dm_belt_rows(&ex); _controls.belt_open=ex; CGPoint q=[t locationInView:self];   // 腰带展开着点别处：先收腰带，这一下不再做别的（不开地图、不点世界、不进绑定） | Tapping elsewhere while the belt is expanded: collapse the belt first, and this tap does nothing else (no map, no world tap, no binding)
           if(dm_tc_belt_outside(&_controls,q.x,q.y)) { dm_belt_expand(0); LOG("前端：腰带展开着点别处 (%.0f,%.0f) → 只收腰带",q.x,q.y); continue; } }
-        if(!_navigation && !_bindTouch && !dm_ui_bind_active()) { BOOL em=NO; CGPoint bp=[t locationInView:self]; uint64_t bk=[self skillKeyAt:bp empty:&em]; if(bk && em) { _bindTouch=t; _bindKey=bk; _bindP0=bp; _mapT0=CACurrentMediaTime(); continue; } }
         if(!_mapTouch && [self inMinimap:[t locationInView:self]]) { _mapTouch=t; _mapP0=[t locationInView:self]; _mapT0=CACurrentMediaTime(); continue; }
         for(int i=0;i<16;i++) if(!_slot[i]) {
             _slot[i]=t; CGPoint p=[t locationInView:self]; { int ex=0; _controls.belt_rows=dm_belt_rows(&ex); _controls.belt_open=ex; } dm_tc_begin_at(&_controls,i,p.x,p.y,CACurrentMediaTime()); slot=i;
@@ -585,9 +620,6 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
                 if(dm_ui_map_is_full()) { dm_ui_map_full(0); LOG("前端：点小地图那一块 (%.0f,%.0f) → 回小地图",p.x,p.y); }
                 else if(z.width>0) { { float wx,wy; world_norm(self,p.x,p.y,&wx,&wy); _mapWorldSeq=dm_world_tap(wx,wy); } _mapWorldAsked=YES; _mapWorldPt=p; } }
             continue; }
-        if(t==_bindTouch) { CGPoint p=[t locationInView:self]; _bindTouch=nil;
-            if(!strcmp(phase,"ended") && !_navigation && hypot(p.x-_bindP0.x,p.y-_bindP0.y)<=14) { dm_ui_bind_begin(_bindKey); LOG("前端：点空技能位 (%.0f,%.0f) → 给键 %#llx 选技能",p.x,p.y,(unsigned long long)_bindKey); }
-            continue; }
         if(t==_mapBackTouch) { CGPoint p=[t locationInView:self]; _mapBackTouch=nil;
             if(!strcmp(phase,"ended") && !_navigation && dm_ui_map_is_full() && hypot(p.x-_mapP0.x,p.y-_mapP0.y)<=14 && CACurrentMediaTime()-_mapT0<0.6) { dm_ui_map_full(0); LOG("前端：全屏地图开着，点空处 (%.0f,%.0f) → 回小地图",p.x,p.y); } }
         // 松手时宿主的答案还没回就先不结束这根手指（外部 PR 指出，自己实现）：
@@ -626,7 +658,13 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
             BOOL wasPtr=_controls.pointer_slot==i; unsigned tm=_controls.tap_move_seq;
             // 按下 / 移动 / 抬起都取事件这一刻的时间（同 tick 的时钟）：面板开着时显示节拍降到 2 次 / 秒，原先取「上一拍的时刻」，0.12 秒的点按会被量成 0.5 秒、不算点按（点页签不切）
             // Press / move / lift all take the time of the event itself (same clock as tick): with a panel open the display link drops to 2 per second, and previously "the time of the previous display-link tick" was used, so a 0.12-second tap was measured as 0.5 seconds and not counted as a tap (tapping a tab did not switch)
-            if(_pendFire) dm_tc_end_at(&_controls,i,_pendEndTime); else dm_tc_end_at(&_controls,i,CACurrentMediaTime()); _slot[i]=nil; slot=i;
+            dm_tc_finger finished=_controls.finger[i];
+            double endedAt=_pendFire?_pendEndTime:CACurrentMediaTime();
+            if(_pendFire) dm_tc_end_at(&_controls,i,endedAt); else dm_tc_end_at(&_controls,i,endedAt); _slot[i]=nil; slot=i;
+            /* 空槽短点由 C 状态机在松手时一次性确认；UIKit 不再对已结束的触摸
+               重算时长 / 位移或读取可能已变的面板状态，从而不会偶发丢掉绑定。 */
+            if(!strcmp(phase,"ended")) { uint64_t key=dm_tc_take_bind_request(&_controls);
+                if(key) { dm_ui_bind_begin(key); LOG("前端：点空技能位 (%.0f,%.0f) → 给键 %#llx 选技能",finished.x,finished.y,(unsigned long long)key); } }
             // 加点用手势不用按钮：第一下点技能图标 / 属性「+」= 选中（光标过去、出说明），同一个再点一下 = 加 1 点；换目标重新从选中开始
             // Spend points with a gesture, not a button: the first tap on a skill icon / stat "+" = select (cursor moves there, tooltip appears); tapping the same one again = add 1 point; changing target starts over from select
             if(_controls.tap_move_seq!=tm) { uint32_t hid=dm_ui_hit_id();

@@ -14,7 +14,17 @@ enum {
     DM_TC_PORTAL, DM_TC_BELT1, DM_TC_BELT2, DM_TC_BELT3, DM_TC_BELT4,
     DM_TC_MENU, DM_TC_MAP
 };
-typedef struct { float x, y, r; uint64_t button; } dm_tc_target;
+#define DM_TC_MAIN_RADIUS 60.0f
+#define DM_TC_LAYOUT_HOLD_S 0.5
+#define DM_TC_LAYOUT_DRAG_PT 12.0f
+/* 前端在判定短点击时也需要使用与手势层相同的阈值。 */
+#define DM_TC_POINTER_MOVE_PT 10.0f
+#define DM_TC_POINTER_TAP_S 0.35
+/* 空技能位只是在等待用户重新绑定；它不应要求战斗点按那么快。保留此前
+   UIKit 入口的 0.6 秒 / 14 点容差，并由 C 状态机一次性产出绑定请求。 */
+#define DM_TC_EMPTY_SLOT_TAP_S 0.60
+#define DM_TC_EMPTY_SLOT_MOVE_PT 14.0f
+typedef struct { float x, y, r; uint64_t button; int manual_empty; } dm_tc_target;
 typedef struct {
     float width, height;
     dm_tc_target target[DM_TC_COUNT];
@@ -40,6 +50,8 @@ typedef struct {
     int ui_drag;
     int shop_drag;   /* 从商人货架的货上起拖（不拿起）：松手按落点买 / 不买 | Drag starting from goods on the vendor shelf (not picked up): on release, buy / do not buy by the drop point */
     int locked_drag; /* 单件任务槽占用时从别的物品上起拖：不拿起，松手不发任何键 | Drag starting from another item while the single-item quest slot is occupied: do not pick up, and send no key on release */
+    int layout_editing, layout_edit_target; /* 长按右下角键后拖动布局；编辑期间不发送该键 | Long-press layout editing for a right-side key; do not send that key while editing */
+    float layout_preview_x, layout_preview_y;
 } dm_tc_finger;
 typedef struct {
     dm_tc_layout layout;
@@ -59,11 +71,13 @@ typedef struct {
     uint64_t defer_button; double defer_at_s;   /* 第二组里点得太短的那一下：等 ZL 领先够了再补发 | The too-short tap in the second set: make it up once ZL has led long enough */
     /* 技能组：0 = 第一套；1 = 第二套（原版 Switch 按住 ZL 用 alt 槽）。是模式，不随取消/尺寸变化清零 | Skill set: 0 = first set; 1 = second set (on the original Switch game, holding ZL uses the alt slots). It is a mode and is not cleared on cancel/size change */
     int skill_set;
+    uint64_t bind_request; /* 空的主攻击 / 技能位短点后待前端取走的原生按键掩码 | Native key mask requested by a short tap on an empty main/skill slot; taken by the front end */
     /* 第二组技能（ZL 修饰）：ZL 只在手指按着主钮 / 技能钮、或技能脉冲在发时按着，且先于技能键 DM_TC_ZL_LEAD_S 按下。
        松手施放按得太短时，这一下脉冲延到 ZL 领先够了再发（dm_tc_tick 到点起）。
        Second skill set (ZL modifier): ZL is held only while a finger is on the main button / a skill button or a skill pulse is being sent, and goes down DM_TC_ZL_LEAD_S before the skill button.
               When a release-to-cast press is too short, that pulse is delayed until ZL has led long enough (dm_tc_tick starts it when due). */
     int pointer_slot;
+    uint64_t layout_edit_seq; /* 右下角键位完成一次拖动后递增，前端据此持久化 | Incremented after a right-side key finishes moving; the front end persists the layout */
     double last_time_s;
     int pointer_pickup_done;
     int pointer_pulse_active, pointer_pulse_pending;
@@ -147,6 +161,17 @@ void dm_tc_set_safe_insets(float left, float right);
 void dm_tc_set_edge_bottom(float bottom);   /* 屏幕底边归系统的那一条的高度（点）；0 = 没有。只约束移动摇杆的起手 | Height (points) of the strip along the bottom edge of the screen that belongs to the system; 0 = none. Constrains only where the movement stick may start */
 void dm_tc_layout_make(dm_tc_layout *layout, float width, float height);
 int dm_tc_hit(const dm_tc_layout *layout, float x, float y);
+int dm_tc_bind_target_at(const dm_tc_layout *layout, uint32_t enabled_targets, float x, float y);
+void dm_tc_clear_key_position_overrides(void);
+void dm_tc_set_key_position_override(int target, float nx, float ny, int visible);
+int dm_tc_get_key_position_override(int target, float *nx, float *ny, int *visible);
+void dm_tc_set_key_position(dm_tc_state *state, int target, float x, float y);
+void dm_tc_set_key_empty(dm_tc_state *state, int target, int empty);
+/* A completed native binding makes a manually emptied touch slot usable again.
+   Returns the restored target, or DM_TC_NONE when the binding does not belong to an empty touch slot. */
+int dm_tc_mark_key_bound(dm_tc_state *state, uint64_t key_mask);
+uint64_t dm_tc_take_bind_request(dm_tc_state *state); /* 空槽短点产生的绑定请求；取走一次后清零 | Binding request made by a short tap on an empty slot; returns it once and clears it */
+void dm_tc_reset_key_positions(dm_tc_state *state);
 #define DM_TC_POINTER_LIFT_PT 40.0f   // 功能页拖动时物品抬在手指上方的点数（× 控件缩放） | Number of points the item is lifted above the finger while dragging on function pages (× widget scale)
 void dm_tc_set_tall_scale(int on);   // 画面高 > 440 点时按 高/440 放大的开关；缺省关（Mac 宿主触屏用例传的是像素数，不能放大），iOS 前端建视图时开 | Switch for scaling up by height/440 when picture height > 440 points; default off (the Mac host touch test cases pass pixel counts and must not be scaled up); the iOS front end turns it on when creating the view
 float dm_tc_scale_for_size(float width, float height);   // 控件缩放：手机 min(1, 宽/667, 高/375)；画面高 > 440 点（iPad）时按 高/440 等比放大 | Widget scale: phone min(1, width/667, height/375); when picture height > 440 points (iPad), scale up proportionally by height/440

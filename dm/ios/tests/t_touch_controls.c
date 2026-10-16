@@ -35,7 +35,7 @@ static void layout_at(float w, float h) {
         }
     }
     float k = g_tall && h > 440 ? h/440 : 1;   /* 缺省 1；前端开了大画面放大（g_tall）且画面比手机高（iPad 的 16:9 块）时技能钮按画面高度等比放大 | Default 1; when the front end has large-display scale-up on (g_tall) and the display is taller than a phone (the iPad 16:9 block), skill buttons scale up proportionally with display height */
-    NEAR(l.target[DM_TC_MAIN].r,40*k,0.001);
+    NEAR(l.target[DM_TC_MAIN].r,DM_TC_MAIN_RADIUS*k,0.001);
     for (int i=DM_TC_SKILL1; i<=DM_TC_SKILL4; ++i) {
         NEAR(l.target[i].r,26*k,0.001);
         NEAR(hypotf(l.target[i].x-l.target[0].x,l.target[i].y-l.target[0].y),112*k,0.001);
@@ -76,10 +76,10 @@ static void layout_812(void) { layout_at(812,375); }
 static void layout_956(void) { layout_at(956,440); }
 static void layout_1024(void) { layout_at(1024,768); }
 static void layout_ipad169(void) { dm_tc_set_tall_scale(g_tall = 1); layout_at(1366,768); dm_tc_set_tall_scale(g_tall = 0); }   /* 13 寸 iPad 上居中的 16:9 块：开了放大 | The centered 16:9 block on the 13-inch iPad: scale-up is on */
-static void layout_pixels(void) { layout_at(2868,1320); }   /* Mac 宿主触屏用例通路把像素数当点数传：没开放大，主钮半径仍是 40、位置不变 | The Mac host touch-case path passes pixel counts as point counts: scale-up is not on, the main button radius is still 40 and its position is unchanged */
+static void layout_pixels(void) { layout_at(2868,1320); }   /* Mac 宿主触屏用例通路把像素数当点数传：没开放大，主钮半径仍按 48、位置不变 | The Mac host touch-case path passes pixel counts as point counts: scale-up is not on, the main button radius stays 48 and its position is unchanged */
 static void small_layout(void) {
     dm_tc_layout l; dm_tc_layout_make(&l,333.5f,187.5f);
-    NEAR(l.target[0].r,20,0.001); NEAR(l.joy_radius,30,0.001);
+    NEAR(l.target[0].r,DM_TC_MAIN_RADIUS*0.5f,0.001); NEAR(l.joy_radius,30,0.001);
     for(int i=0;i<DM_TC_COUNT;i++) {
         CHECK(l.target[i].x>=l.target[i].r && l.target[i].x+l.target[i].r<=l.width);
         CHECK(l.target[i].y>=l.target[i].r && l.target[i].y+l.target[i].r<=l.height);
@@ -96,6 +96,16 @@ static void hit_edges(void) {
     CHECK(dm_tc_hit(&l,-1,50)==DM_TC_NONE);
     CHECK(dm_tc_hit(&l,800,50)==DM_TC_NONE);
     CHECK(dm_tc_hit(&l,NAN,50)==DM_TC_NONE);
+}
+/* 空的主攻击位必须走与空技能位相同的绑定入口；非技能控件不能进入绑定 | An empty main attack slot must use the same binding entry as empty skill slots; non-skill controls must not enter binding */
+static void bind_target_hit(void) {
+    dm_tc_layout l; dm_tc_layout_make(&l,667,375);
+    uint32_t all=(1u<<DM_TC_COUNT)-1;
+    CHECK(dm_tc_hit(&l,l.target[DM_TC_MAIN].x+44,l.target[DM_TC_MAIN].y)==DM_TC_MAIN);
+    CHECK(dm_tc_bind_target_at(&l,all,l.target[DM_TC_MAIN].x,l.target[DM_TC_MAIN].y)==DM_TC_MAIN);
+    CHECK(dm_tc_bind_target_at(&l,all,l.target[DM_TC_SKILL1].x,l.target[DM_TC_SKILL1].y)==DM_TC_SKILL1);
+    CHECK(dm_tc_bind_target_at(&l,all,l.target[DM_TC_PORTAL].x,l.target[DM_TC_PORTAL].y)==DM_TC_NONE);
+    CHECK(dm_tc_bind_target_at(&l,all & ~(1u<<DM_TC_MAIN),l.target[DM_TC_MAIN].x,l.target[DM_TC_MAIN].y)==DM_TC_NONE);
 }
 static void key_hold_and_ownership(void) {
     dm_tc_state s; dm_tc_init(&s,667,375);
@@ -453,24 +463,98 @@ static void pointer_pulse_queue(void) {
     CHECK(!dm_tc_pulse_resume(&s)); CHECK(dm_tc_pulse_end(&s,s.pulse_epoch)); CHECK(!dm_tc_pulse_pending(&s));
 }
 
-/* 安全区内缩：956×440、左右各 62 点。期望手算：主键右沿 = 956−62 = 894 → 主键中心 x = 854（原 900，移 46）；弧上四键与换组键同移 46；
+/* 安全区内缩：956×440、左右各 62 点。主键半径扩大到 60 后，默认中心为 896；安全区右沿 = 894 → 中心 x = 834，整组左移 62；
    摇杆中心 x = 62+60 = 122（原 90）；y 都不变。设回 0 后恢复原布局。
-   Safe area inset: 956×440, 62 points on each of left and right. Expected values hand-computed: main button right edge = 956−62 = 894 → main button center x = 854 (was 900, moved 46); the four buttons on the arc and the set-switch button move the same 46;
+   Safe area inset: 956×440, 62 points on each of left and right. With the enlarged radius 60 the default center is 896; safe-area right edge = 894 → center x = 834, and the whole group moves left by 62;
       stick center x = 62+60 = 122 (was 90); all y unchanged. After setting back to 0 the original layout is restored. */
 static void safe_insets(void) {
     dm_tc_layout a, b; dm_tc_layout_make(&a, 956, 440);
     dm_tc_set_safe_insets(62, 62); dm_tc_layout_make(&b, 956, 440); dm_tc_set_safe_insets(0, 0);
-    NEAR(a.target[DM_TC_MAIN].x, 900, 0.001); NEAR(b.target[DM_TC_MAIN].x, 854, 0.001); NEAR(b.target[DM_TC_MAIN].y, a.target[DM_TC_MAIN].y, 0.001);
-    for (int i = DM_TC_SKILL1; i <= DM_TC_SKILL4; ++i) { NEAR(a.target[i].x - b.target[i].x, 46, 0.001); NEAR(a.target[i].y, b.target[i].y, 0.001); CHECK(b.target[i].x + b.target[i].r <= 894.001f); }
-    NEAR(a.swap.x - b.swap.x, 46, 0.001); NEAR(a.joy_x, 120, 0.001); NEAR(b.joy_x, 152, 0.001); NEAR(b.joy_min_x, 68, 0.001); NEAR(a.joy_y, 325, 0.001); NEAR(a.joy_max_y, 372, 0.001);   /* 静止位 max(90, 安全区 + 60) + 30、440 − 115（让安全区）；夹回界 60 + 8、440 − 60 − 8（不让安全区） | rest position max(90, safe area + 60) + 30, 440 - 115 (respecting the safe area); clamp bounds 60 + 8, 440 - 60 - 8 (not respecting the safe area) */
-    dm_tc_layout c; dm_tc_layout_make(&c, 956, 440); NEAR(c.target[DM_TC_MAIN].x, 900, 0.001);
+    NEAR(a.target[DM_TC_MAIN].x, 896, 0.001); NEAR(b.target[DM_TC_MAIN].x, 834, 0.001); NEAR(b.target[DM_TC_MAIN].y, a.target[DM_TC_MAIN].y, 0.001);
+    for (int i = DM_TC_SKILL1; i <= DM_TC_SKILL4; ++i) { NEAR(a.target[i].x - b.target[i].x, 62, 0.001); NEAR(a.target[i].y, b.target[i].y, 0.001); CHECK(b.target[i].x + b.target[i].r <= 894.001f); }
+    NEAR(a.swap.x - b.swap.x, 62, 0.001); NEAR(a.joy_x, 120, 0.001); NEAR(b.joy_x, 152, 0.001); NEAR(b.joy_min_x, 68, 0.001); NEAR(a.joy_y, 325, 0.001); NEAR(a.joy_max_y, 372, 0.001);   /* 静止位 max(90, 安全区 + 60) + 30、440 − 115（让安全区）；夹回界 60 + 8、440 − 60 − 8（不让安全区） | rest position max(90, safe area + 60) + 30, 440 - 115 (respecting safe area); clamp bounds 60 + 8, 440 - 60 - 8 (not respecting safe area) */
+    dm_tc_layout c; dm_tc_layout_make(&c, 956, 440); NEAR(c.target[DM_TC_MAIN].x, 896, 0.001);
 }
 /* 换组键：956×440 下主键中心 (900,358)，换组键在技能一正下方 (900−112, 358+52) = (788,410)，半径 22；不与技能一（中心 (788,358) 半径 26）重叠、不出屏 | Set-switch button: at 956×440 the main button center is (900,358), the set-switch button is directly below skill one at (900−112, 358+52) = (788,410), radius 22; it does not overlap skill one (center (788,358), radius 26) and does not go off screen */
 static void swap_key(void) {
     dm_tc_layout l; dm_tc_layout_make(&l, 956, 440);
-    NEAR(l.swap.x, 788, 0.001); NEAR(l.swap.y, 410, 0.001); NEAR(l.swap.r, 22, 0.001);
+    NEAR(l.swap.x, 784, 0.001); NEAR(l.swap.y, 410, 0.001); NEAR(l.swap.r, 22, 0.001);
     CHECK(l.swap.y - l.swap.r >= l.target[DM_TC_SKILL1].y + l.target[DM_TC_SKILL1].r); CHECK(l.swap.y + l.swap.r <= 440);
-    CHECK(dm_tc_hit(&l, 788, 410) == DM_TC_SWAP);
+    CHECK(dm_tc_hit(&l, 784, 410) == DM_TC_SWAP);
+}
+static void layout_drag_swap_empty_reset(void) {
+    dm_tc_clear_key_position_overrides(); dm_tc_set_safe_insets(0, 0);
+    dm_tc_state s; dm_tc_init(&s, 956, 440);
+    float mx=s.layout.target[DM_TC_MAIN].x, my=s.layout.target[DM_TC_MAIN].y;
+    float x1=s.layout.target[DM_TC_SKILL1].x, y1=s.layout.target[DM_TC_SKILL1].y;
+    dm_tc_begin_at(&s,0,mx,my,1.0); CHECK(s.buttons==DM_BTN_A);
+    dm_tc_move_at(&s,0,mx,my,1.2); CHECK(!s.finger[0].layout_editing && s.buttons==DM_BTN_A);
+    dm_tc_move_at(&s,0,x1,y1,1.6); CHECK(s.finger[0].layout_editing && s.buttons==0);
+    dm_tc_end_at(&s,0,1.61); CHECK(s.buttons==0 && s.layout_edit_seq==1);
+    NEAR(s.layout.target[DM_TC_MAIN].x,x1,0.001); NEAR(s.layout.target[DM_TC_MAIN].y,y1,0.001);
+    NEAR(s.layout.target[DM_TC_SKILL1].x,mx,0.001); NEAR(s.layout.target[DM_TC_SKILL1].y,my,0.001);
+    float nx=0,ny=0; int visible=0; CHECK(dm_tc_get_key_position_override(DM_TC_MAIN,&nx,&ny,&visible) && visible);
+
+    float sx=s.layout.target[DM_TC_SKILL2].x, sy=s.layout.target[DM_TC_SKILL2].y;
+    dm_tc_begin_at(&s,0,sx,sy,2.0); dm_tc_move_at(&s,0,300,100,2.6); CHECK(s.finger[0].layout_editing && s.buttons==0);
+    dm_tc_end_at(&s,0,2.61); CHECK(s.layout_edit_seq==2 && s.layout.target[DM_TC_SKILL2].r>0 && s.layout.target[DM_TC_SKILL2].manual_empty);
+    CHECK(dm_tc_hit(&s.layout,sx,sy)==DM_TC_SKILL2);
+    CHECK(dm_tc_get_key_position_override(DM_TC_SKILL2,&nx,&ny,&visible) && !visible);
+    dm_tc_begin_at(&s,0,sx,sy,2.7); CHECK(s.buttons==0); dm_tc_end_at(&s,0,2.8); CHECK(s.buttons==0 && s.pulse_button==0);
+
+    float x2=s.layout.target[DM_TC_SKILL2].x, y2=s.layout.target[DM_TC_SKILL2].y;
+    float x3=s.layout.target[DM_TC_SKILL3].x, y3=s.layout.target[DM_TC_SKILL3].y;
+    dm_tc_begin_at(&s,0,x2,y2,2.8); CHECK(s.finger[0].target==DM_TC_SKILL2 && s.buttons==0);
+    dm_tc_move_at(&s,0,x3,y3,3.4); CHECK(s.finger[0].layout_editing && s.buttons==0);
+    dm_tc_end_at(&s,0,3.41); CHECK(s.layout_edit_seq==3);
+    CHECK(s.layout.target[DM_TC_SKILL2].manual_empty && s.layout.target[DM_TC_SKILL3].manual_empty==0);
+    NEAR(s.layout.target[DM_TC_SKILL2].x,x3,0.001); NEAR(s.layout.target[DM_TC_SKILL2].y,y3,0.001);
+    NEAR(s.layout.target[DM_TC_SKILL3].x,x2,0.001); NEAR(s.layout.target[DM_TC_SKILL3].y,y2,0.001);
+    CHECK(s.layout.target[DM_TC_SKILL2].r>0 && dm_tc_hit(&s.layout,x3,y3)==DM_TC_SKILL2);
+
+    dm_tc_begin_at(&s,0,s.layout.swap.x,s.layout.swap.y,4.0); dm_tc_end_at(&s,0,4.6);
+    CHECK(s.layout_edit_seq==4 && s.layout.target[DM_TC_SKILL2].r>0 && !s.layout.target[DM_TC_SKILL2].manual_empty);
+    CHECK(!dm_tc_get_key_position_override(DM_TC_SKILL2,&nx,&ny,&visible));
+    dm_tc_begin_at(&s,0,s.layout.target[DM_TC_SKILL3].x,s.layout.target[DM_TC_SKILL3].y,5.0); dm_tc_end_at(&s,0,5.1);
+    CHECK(s.layout_edit_seq==4);
+}
+/* A slot cleared by dragging to empty is a layout override, not a permanent ban on
+   its controller key. A successful native binding must restore the same slot. */
+static void binding_restores_empty_slot(void) {
+    dm_tc_clear_key_position_overrides();
+    dm_tc_state s; dm_tc_init(&s,956,440);
+    dm_tc_set_key_empty(&s,DM_TC_SKILL2,1);
+    CHECK(s.layout.target[DM_TC_SKILL2].manual_empty);
+    unsigned before=(unsigned)s.layout_edit_seq;
+    CHECK(dm_tc_mark_key_bound(&s,DM_BTN_X)==DM_TC_SKILL2);
+    CHECK(!s.layout.target[DM_TC_SKILL2].manual_empty);
+    CHECK(s.layout_edit_seq==before+1);
+    float nx=0,ny=0; int visible=0;
+    CHECK(dm_tc_get_key_position_override(DM_TC_SKILL2,&nx,&ny,&visible) && visible);
+    CHECK(dm_tc_mark_key_bound(&s,DM_BTN_X)==DM_TC_NONE);
+    dm_tc_set_key_empty(&s,DM_TC_SKILL3,1);
+    CHECK(dm_tc_mark_key_bound(&s,DM_BTN_Y|DM_BTN_ZL)==DM_TC_SKILL3);
+    CHECK(!s.layout.target[DM_TC_SKILL3].manual_empty);
+}
+/* 绑定请求必须由同一份触摸状态在松手时产出：空槽允许正常手指时长和轻微
+   偏移，不再由 UIKit 在状态已结束后重新按更严阈值猜一次。 */
+static void empty_slot_tap_requests_binding(void) {
+    dm_tc_state s; dm_tc_init(&s,956,440);
+    dm_tc_set_key_empty(&s,DM_TC_MAIN,1);
+    float mx=s.layout.target[DM_TC_MAIN].x, my=s.layout.target[DM_TC_MAIN].y;
+    dm_tc_begin_at(&s,0,mx,my,1.0); dm_tc_move_at(&s,0,mx+13,my,1.30); dm_tc_end_at(&s,0,1.50);
+    CHECK(dm_tc_take_bind_request(&s)==DM_BTN_A);
+    CHECK(dm_tc_take_bind_request(&s)==0);
+
+    dm_tc_set_key_empty(&s,DM_TC_SKILL2,1); s.skill_set=1;
+    float x=s.layout.target[DM_TC_SKILL2].x, y=s.layout.target[DM_TC_SKILL2].y;
+    dm_tc_begin_at(&s,0,x,y,2.0); dm_tc_move_at(&s,0,x-13,y,2.20); dm_tc_end_at(&s,0,2.45);
+    CHECK(dm_tc_take_bind_request(&s)==(DM_BTN_X|DM_BTN_ZL));
+
+    dm_tc_begin_at(&s,0,x,y,3.0); dm_tc_move_at(&s,0,x+15,y,3.2); dm_tc_end_at(&s,0,3.3);
+    CHECK(dm_tc_take_bind_request(&s)==0);
+    dm_tc_begin_at(&s,0,x,y,4.0); dm_tc_end_at(&s,0,4.61);
+    CHECK(dm_tc_take_bind_request(&s)==0);
 }
 /* 腰带展开手势（956×440，u = 440/1320 = 1/3：腰带第 1 列格心 x = 478 + (1210−1434)/3 = 403.33、y = 1241.5/3 = 413.83）。
    （腰带一律松手后等过双击窗才喝。）只有 1 排：按下不发键、松手过窗 → 一个脉冲。4 排：按下不发键；松手没滑 → 过窗一个脉冲；上滑过 24 点 → 请求 1（展开）且不发键；下滑 → 请求 2。
@@ -581,10 +665,10 @@ static void belt_single_double(void) {
 }
 int main(void) {
     RUN(layout_667); RUN(layout_812); RUN(layout_956); RUN(layout_1024); RUN(layout_ipad169); RUN(layout_pixels); RUN(small_layout); RUN(difficulty_picker);
-    RUN(hit_edges); RUN(key_hold_and_ownership); RUN(two_fingers_same_key); RUN(joystick_deadzone); RUN(joystick_clamp_956);
+    RUN(hit_edges); RUN(bind_target_hit); RUN(key_hold_and_ownership); RUN(two_fingers_same_key); RUN(joystick_deadzone); RUN(joystick_clamp_956);
     RUN(joystick_axes); RUN(joystick_plus_skills); RUN(no_auto_handoff); RUN(background_no_key);
     RUN(circles_before_joystick); RUN(cancel_and_resize); RUN(deferred_skill_vs_belt); RUN(held_skill2_vs_belt); RUN(belt_single_double); RUN(no_ui_drag_outside_modal); RUN(invalid_slots_and_repeated_begin); RUN(all_slots_hold); RUN(enabled_targets); RUN(ui_scene_messages);
     RUN(pointer_tap); RUN(world_tap); RUN(pointer_outside_close); RUN(scene_dialog_only); RUN(pointer_item_tap); RUN(pointer_stack_tap); RUN(pointer_over_disabled_target); RUN(ui_drag_typing); RUN(pointer_drag_out); RUN(pointer_drag); RUN(pointer_long); RUN(pointer_long_then_drag); RUN(pointer_long_seq); RUN(pointer_shop_drag); RUN(pointer_control_hit); RUN(pointer_game_mode); RUN(pointer_pulse_queue); RUN(safe_insets); RUN(swap_key);
-    RUN(belt_expand);
+    RUN(belt_expand); RUN(layout_drag_swap_empty_reset); RUN(binding_restores_empty_slot); RUN(empty_slot_tap_requests_binding);
     printf("PASS %d/%d cases; %d/%d checks\n",cases,cases,checks,checks); return 0;
 }

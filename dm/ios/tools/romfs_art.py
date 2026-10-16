@@ -8,7 +8,7 @@
     sprite(romfs, path)  sprite → whole RGBA image (multiple frames side by side). v61 = DXT5 block-linear (un-block-linearized with the repo's dm/gfx/tex/nvn_deswizzle.c compiled on the fly), v31 = raw RGBA
     font(romfs, name)    write the original game's font to a temp file and return the path (for PIL ImageFont.truetype)
     out_dir()            root directory of generated build output (gen_paths.gen_dir: environment variable DM_GEN_ASSETS, default dm/ios/Gen/assets, not in git)"""
-import ctypes as C, io, os, struct, subprocess, tempfile
+import ctypes as C, io, os, struct, subprocess, sys, tempfile
 from PIL import Image
 import touch_layout
 
@@ -32,7 +32,8 @@ def lib():
         # Windows 上动态库的函数要点名导出才找得到（实测：不带这三项能编能加载，但取不到函数）
         # On Windows a dynamic library's functions must be exported by name to be found (measured: without these three options it compiles and loads, but the functions cannot be fetched)
         win = ['-Wl,/EXPORT:nvn_tex_layout', '-Wl,/EXPORT:nvn_deswizzle', '-Wl,/EXPORT:nvn_swizzle'] if os.name == 'nt' else ['-fPIC']
-        subprocess.run(['clang', '-O2', '-shared', *win, '-I' + os.path.join(DM, 'gfx', 'nvn'), '-I' + os.path.join(DM, 'gfx', 'tex'), '-o', p,
+        cc = ['xcrun', '--sdk', 'macosx', 'clang'] if sys.platform == 'darwin' else ['clang']
+        subprocess.run([*cc, '-O2', '-shared', *win, '-I' + os.path.join(DM, 'gfx', 'nvn'), '-I' + os.path.join(DM, 'gfx', 'tex'), '-o', p,
                         os.path.join(DM, 'gfx', 'tex', 'nvn_deswizzle.c'), os.path.join(DM, 'gfx', 'nvn', 'nvn_tex.c')], check=True)
         L = C.CDLL(p); L.nvn_tex_layout.argtypes = [C.POINTER(Desc), C.POINTER(Layout)]
         L.nvn_deswizzle.argtypes = [C.POINTER(Desc), C.c_uint, C.c_uint, C.c_void_p, C.c_void_p, C.c_size_t]

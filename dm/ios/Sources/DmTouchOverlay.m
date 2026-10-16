@@ -167,10 +167,12 @@ static void v4text(NSString *str, NSDictionary *glyphs, CGFloat x, CGFloat basel
     if (self.navigationMode) { labels[0]=@(dm_ui("dmTcNavConfirm")); labels[1]=@(dm_ui("dmTcNavBack")); labels[2]=@(dm_ui("dmTcNavAction")); labels[3]=@(dm_ui("dmTcNavBind")); labels[4]=@(dm_ui("dmTcNavNext")); }   // 底栏十字位置的「关闭」已去：关闭入口只留外框右上角那一个（dm_tc_nav_mask） | The 「关闭」(Close) at the bottom bar cross position has been removed: the only close entry left is the one at the top-right corner of the outer frame (dm_tc_nav_mask)
     for (int i=0;i<DM_TC_COUNT;i++) {
         if (!(s->enabled_targets & (1u<<i))) continue;
-        if(i>DM_TC_PORTAL && i<=DM_TC_MENU) continue; // 底部 UI v4：腰带 / 功能入口（十字）由底栏画（drawV4 / 原生 HUD），这里只保命中区，面板态也一样—— | Bottom UI v4: the belt / function entry (cross) is drawn by the bottom bar (drawV4 / native HUD); only the hit area is kept here, in panel state too —
-                                                      // 原先只在游戏态跳过：只开着 NPC 对话菜单时（导航态 3，十字可点）这一格被画成圆底 + 写死的中文「功能」，英文界面也写中文。回城（技能弧上方圆钮）照技能钮画
-                                                      // Previously skipped only in the gameplay state: with only the NPC dialog menu open (navigation state 3, cross tappable) this cell was drawn as a round base plus the hardcoded Chinese "功能" (Functions), even in the English UI. Town Portal (the round button above the skill arc) is drawn like a skill button
-        const dm_tc_target *t = &l->target[i]; CGRect b = CGRectMake(t->x-t->r,t->y-t->r,t->r*2,t->r*2);
+        if(i>DM_TC_PORTAL && i<=DM_TC_MENU) continue; // 底部 UI v4：腰带 / 功能入口（十字）由底栏画（drawV4 / 原生 HUD），这里只保命中区，面板态也一样。回城（技能弧上方圆钮）照技能钮画 | Bottom UI v4: belt / function entry (cross) are drawn by the bottom bar (drawV4 / native HUD); only hit-testing remains here in every mode. Town portal (round button above the skill arc) is drawn like a skill button
+        dm_tc_target preview=l->target[i];
+        for (int f=0; f<DM_TC_MAX_TOUCH; ++f) if (s->finger[f].active && s->finger[f].layout_editing && s->finger[f].layout_edit_target==i) {
+            preview.x=s->finger[f].layout_preview_x; preview.y=s->finger[f].layout_preview_y; break;
+        }
+        const dm_tc_target *t = &preview; CGRect b = CGRectMake(t->x-t->r,t->y-t->r,t->r*2,t->r*2);
         BOOL held = t->button != 0 && (s->buttons & t->button) == t->button;
         if(i==DM_TC_PORTAL) for(int f=0;f<DM_TC_MAX_TOUCH;f++) held|=s->finger[f].active && s->finger[f].target==DM_TC_PORTAL;   // 回城钮不出按键（宿主施放回城技能），按住态看手指 | The town portal button emits no key (the host casts the town portal skill); the held state is read from the fingers
         CGFloat opacity = held ? .6 : .28;
@@ -195,7 +197,7 @@ static void v4text(NSString *str, NSDictionary *glyphs, CGFloat x, CGFloat basel
         }
         UIImage *icon=nil; BOOL showCaption=YES; int ssKind=0, ssCharges=0;
         if(!self.navigationMode && i<=DM_TC_SKILL4) {
-            dm_ta_glyph g=shown_glyph(&native,t->button,hostNow,s->skill_set);
+            dm_ta_glyph g=t->manual_empty ? (dm_ta_glyph){.status=DM_TA_EMPTY,.reason="manual_empty"} : shown_glyph(&native,t->button,hostNow,s->skill_set);
             if(g.status!=DM_TA_EMPTY && g.status!=DM_TA_UNKNOWN) { int dm_swapskill_slot(int,int*); ssKind=dm_swapskill_slot(g.slot,&ssCharges); }
             icon=[self skillImage:g held:held];
             showCaption=g.status!=DM_TA_EMPTY && !icon;
@@ -283,13 +285,13 @@ static void v4text(NSString *str, NSDictionary *glyphs, CGFloat x, CGFloat basel
     NSString *names[DM_TC_COUNT]={@"main",@"skill1",@"skill2",@"skill3",@"skill4",@"portal",@"belt1",@"belt2",@"belt3",@"belt4",@"menu",@"map"};
     for(int i=0;i<DM_TC_COUNT;i++) {
         const dm_tc_target *t=&s->layout.target[i];
-        NSMutableDictionary *entry=[@{@"id":names[i],@"rect_pt":@[@(t->x-t->r),@(t->y-t->r),@(t->r*2),@(t->r*2)],@"npad_button":@(t->button),@"visible":@((s->enabled_targets&(1u<<i))!=0)} mutableCopy];
+        NSMutableDictionary *entry=[@{@"id":names[i],@"rect_pt":@[@(t->x-t->r),@(t->y-t->r),@(t->r*2),@(t->r*2)],@"npad_button":@(t->button),@"visible":@((s->enabled_targets&(1u<<i))!=0 && t->r>0)} mutableCopy];
         if(!self.navigationMode && i>=DM_TC_PORTAL && i<=DM_TC_MENU) {
             entry[@"visual_owner"]=i==DM_TC_PORTAL?@"overlay_portal_skill":(i==DM_TC_MENU?@"native_levelup_button":@"native_game_belt"); entry[@"host_drawn"]=@NO;
-            entry[@"touch_enabled"]=@((s->enabled_targets&(1u<<i))!=0);
+            entry[@"touch_enabled"]=@((s->enabled_targets&(1u<<i))!=0 && t->r>0);
         }
         if(i<=DM_TC_SKILL4) {
-            dm_ta_glyph g=shown_glyph(&visualNative,t->button,hostNow,s->skill_set);
+            dm_ta_glyph g=t->manual_empty ? (dm_ta_glyph){.status=DM_TA_EMPTY,.reason="manual_empty"} : shown_glyph(&visualNative,t->button,hostNow,s->skill_set);
             BOOL held=t->button && (s->buttons&t->button)==t->button;
             BOOL drawn=!self.navigationMode && [self skillImage:g held:held]!=nil;
             NSString *status=self.navigationMode?@"navigation_label":(g.status==DM_TA_EMPTY?@"empty_slot":(drawn?@"current_skill":@"empty_unknown"));

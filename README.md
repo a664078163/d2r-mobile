@@ -1,5 +1,7 @@
 # D2R Mobile
 
+最后更新：2026-10-16
+
 **An open-source iOS / macOS compatibility layer for Diablo II: Resurrected with the Reign of the Warlock expansion.** It brings the Nintendo Switch release you bought, expansion included, to iPhone, iPad and Mac in full: the original game code runs natively, every control is rebuilt for touch, the frame rate holds at 60 fps, and you are in a game one second after the main menu. There is now a native macOS version as well (first version): on an Apple silicon Mac it starts on double-click and works with keyboard, mouse and gamepad. Apple TV 4K (3rd generation, A15) has a community port (developer preview) that has reached the character-selection screen only on its author's device; see the device table below.
 
 This is not a tech demo that "sort of runs". It is a mobile version polished for daily play, from your first character all the way through the endgame.
@@ -85,7 +87,7 @@ This is not a gamepad pasted onto the screen. Every panel and every action was r
 </p>
 
 - **Move**: a virtual stick with precise diagonals; tap an NPC or the ground to path there automatically; doors, portals and cave entrances are tappable across their whole surface.
-- **Fight**: press a skill button to cast, hold to keep casting, **drag to aim at any angle**; nearby monsters are targeted automatically. Two skill sets. Skills on your secondary weapons cast with one tap — the game swaps weapons, casts, and swaps back — and the button shows the charges remaining.
+- **Fight**: press a skill button to cast, hold to keep casting, **drag to aim at any angle**; nearby monsters are targeted automatically. Two skill sets. Skills on your secondary weapons cast with one tap — the game swaps weapons, casts, and swaps back — and the button shows the charges remaining. Long-press and drag the main attack button or any of the four skill buttons to swap positions; release over empty space to clear that position. The layout is saved separately from game saves, and the skill-group button restores the default layout.
 - **Boss health bar**: pinned to the top of the screen, showing the percentage remaining.
 - **Items**: tap, double-tap, long-press and drag and drop all track your finger. Double-tap gear to equip or unequip it; drag an item anywhere onto the vendor panel to sell it; on a stack, double-tap takes 1 and long-press takes 3; long-press an empty inventory slot to sort everything.
 - **Text**: typed with the system keyboard. Character names can be in Chinese; leave the name blank for a random one.

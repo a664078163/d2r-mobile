@@ -34,7 +34,8 @@ class Layout(C.Structure): _fields_ = [('size', C.c_uint64), ('layer_size', C.c_
 def lib():
     t = tempfile.mkdtemp(); p = os.path.join(t, 'bl.dll' if os.name == 'nt' else 'bl.dylib')
     win = ['-Wl,/EXPORT:nvn_tex_layout', '-Wl,/EXPORT:nvn_deswizzle', '-Wl,/EXPORT:nvn_swizzle'] if os.name == 'nt' else ['-fPIC']   # 同 romfs_art.py | same as romfs_art.py
-    subprocess.run(['clang', '-O2', '-shared', *win, '-I' + os.path.join(DM, 'gfx', 'nvn'), '-I' + os.path.join(DM, 'gfx', 'tex'), '-o', p,
+    cc = ['xcrun', '--sdk', 'macosx', 'clang'] if sys.platform == 'darwin' else ['clang']
+    subprocess.run([*cc, '-O2', '-shared', *win, '-I' + os.path.join(DM, 'gfx', 'nvn'), '-I' + os.path.join(DM, 'gfx', 'tex'), '-o', p,
                     os.path.join(DM, 'gfx', 'tex', 'nvn_deswizzle.c'), os.path.join(DM, 'gfx', 'nvn', 'nvn_tex.c')], check=True)
     L = C.CDLL(p); L.nvn_tex_layout.argtypes = [C.POINTER(Desc), C.POINTER(Layout)]
     L.nvn_deswizzle.argtypes = [C.POINTER(Desc), C.c_uint, C.c_uint, C.c_void_p, C.c_void_p, C.c_size_t]
