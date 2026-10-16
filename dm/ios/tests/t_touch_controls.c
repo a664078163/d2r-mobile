@@ -566,6 +566,54 @@ static void empty_slot_tap_requests_binding(void) {
     dm_tc_begin_at(&s,0,x,y,4.0); dm_tc_end_at(&s,0,4.61);
     CHECK(dm_tc_take_bind_request(&s)==0);
 }
+/* 玩家在游戏里删掉技能留下的空位（不是拖到空白处留下的）：画着「＋」，点一下也必须进绑定。
+   原先空位判定只看 manual_empty（拖空白才置位），游戏里删出来的空位画着「＋」却被当成一次
+   普通施放——键发出去什么都不做，看着就是「点了没反应」。两条路必须共用一份读数。 */
+/* A slot the player emptied inside the game (not one left by dragging onto blank space): it shows 「＋」,
+   and a tap on it must enter binding. The empty decision used to look only at manual_empty (set solely by
+   dragging onto blank space), so a slot emptied in the game showed 「＋」 but the tap was treated as an
+   ordinary cast -- the key went out and did nothing, which reads as "tapped and nothing happened". The two
+   paths must share one reading. */
+static void game_emptied_slot_tap_requests_binding(void) {
+    dm_tc_state s; dm_tc_init(&s,956,440);
+    /* 四个技能位在游戏里都是空的：手动位一个都没设（等价于从没拖过空白）。 */
+    dm_tc_set_empty_targets(&s,(1u<<DM_TC_SKILL1)|(1u<<DM_TC_SKILL2)|(1u<<DM_TC_SKILL3)|(1u<<DM_TC_SKILL4));
+    CHECK(!s.layout.target[DM_TC_SKILL2].manual_empty);
+    for (int t=DM_TC_SKILL1; t<=DM_TC_SKILL4; ++t) {
+        float x=s.layout.target[t].x, y=s.layout.target[t].y;
+        s.bind_request=0; dm_tc_take_bind_request(&s);
+        dm_tc_begin_at(&s,0,x,y,1.0); dm_tc_end_at(&s,0,1.2);
+        CHECK(dm_tc_take_bind_request(&s)==s.layout.target[t].button);
+        CHECK(s.buttons==0);   /* 空位不发任何按键 | an empty slot sends no key at all */
+    }
+    /* 绑好一个位：这一位立刻不再是空位，下一次点它是正常施放（发出按键），不再吞成绑定。 */
+    CHECK(dm_tc_mark_key_bound(&s,DM_BTN_X)==DM_TC_SKILL2);
+    CHECK(!(s.empty_targets&(1u<<DM_TC_SKILL2)));
+    float x=s.layout.target[DM_TC_SKILL2].x, y=s.layout.target[DM_TC_SKILL2].y;
+    dm_tc_begin_at(&s,0,x,y,2.0); dm_tc_tick(&s,2.09);
+    CHECK(s.buttons==DM_BTN_X);
+    dm_tc_end_at(&s,0,2.2);
+    CHECK(dm_tc_take_bind_request(&s)==0);
+    /* 剩下的三个位照旧是空位。 */
+    for (int t=DM_TC_SKILL1; t<=DM_TC_SKILL4; ++t) if (t!=DM_TC_SKILL2) {
+        float q=s.layout.target[t].x, r=s.layout.target[t].y;
+        s.bind_request=0; dm_tc_take_bind_request(&s);
+        dm_tc_begin_at(&s,0,q,r,3.0); dm_tc_end_at(&s,0,3.15);
+        CHECK(dm_tc_take_bind_request(&s)==s.layout.target[t].button);
+    }
+    /* 主攻击位同样适用：游戏里空着的主钮点一下进绑定，且不发空的 A。 */
+    dm_tc_set_empty_targets(&s,1u<<DM_TC_MAIN);
+    dm_tc_begin_at(&s,0,s.layout.target[DM_TC_MAIN].x,s.layout.target[DM_TC_MAIN].y,4.0);
+    CHECK(s.buttons==0);
+    dm_tc_end_at(&s,0,4.15);
+    CHECK(dm_tc_take_bind_request(&s)==DM_BTN_A);
+    /* 面板态里同样的位置是五个虚拟手柄圆钮，不能被当成空技能位而清零。 */
+    dm_tc_set_navigation_mode(&s,1);
+    dm_tc_begin_at(&s,0,s.layout.target[DM_TC_MAIN].x,s.layout.target[DM_TC_MAIN].y,5.0);
+    dm_tc_tick(&s,5.09);
+    CHECK(s.buttons==DM_BTN_A);
+    dm_tc_end_at(&s,0,5.2);
+}
 /* 腰带展开手势（956×440，u = 440/1320 = 1/3：腰带第 1 列格心 x = 478 + (1210−1434)/3 = 403.33、y = 1241.5/3 = 413.83）。
    （腰带一律松手后等过双击窗才喝。）只有 1 排：按下不发键、松手过窗 → 一个脉冲。4 排：按下不发键；松手没滑 → 过窗一个脉冲；上滑过 24 点 → 请求 1（展开）且不发键；下滑 → 请求 2。
    展开着：点上一排（y 高 165/3 = 55）同列 → 请求 0x100 | 1<<4 | 0，不发键；点世界别处 → 请求 2（收起）。
@@ -680,5 +728,6 @@ int main(void) {
     RUN(circles_before_joystick); RUN(cancel_and_resize); RUN(deferred_skill_vs_belt); RUN(held_skill2_vs_belt); RUN(belt_single_double); RUN(no_ui_drag_outside_modal); RUN(invalid_slots_and_repeated_begin); RUN(all_slots_hold); RUN(enabled_targets); RUN(ui_scene_messages);
     RUN(pointer_tap); RUN(world_tap); RUN(pointer_outside_close); RUN(scene_dialog_only); RUN(pointer_item_tap); RUN(pointer_stack_tap); RUN(pointer_over_disabled_target); RUN(ui_drag_typing); RUN(pointer_drag_out); RUN(pointer_drag); RUN(pointer_long); RUN(pointer_long_then_drag); RUN(pointer_long_seq); RUN(pointer_shop_drag); RUN(pointer_control_hit); RUN(pointer_game_mode); RUN(pointer_pulse_queue); RUN(safe_insets); RUN(swap_key);
     RUN(belt_expand); RUN(layout_drag_swap_empty_reset); RUN(binding_restores_empty_slot); RUN(empty_slot_tap_requests_binding);
+    RUN(game_emptied_slot_tap_requests_binding);
     printf("PASS %d/%d cases; %d/%d checks\n",cases,cases,checks,checks); return 0;
 }

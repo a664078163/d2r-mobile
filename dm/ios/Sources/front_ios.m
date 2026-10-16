@@ -73,6 +73,7 @@ static BOOL touch_control_log_enabled(void) {
 - (void)restartCover:(int)mode;
 - (void)captureTouchLayer:(NSString *)path;
 - (void)refreshPortalBinding;
+- (void)syncEmptySkillTargets;
 - (void)restoreTouchLayout;
 - (void)persistTouchLayout;
 @end
@@ -305,14 +306,20 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
 //   empty slot: this finger does not enter the gesture layer, and one tap = choose a skill for this slot (dm_ui_bind_begin, the host opens the skill tree);
 //   bound: enters the gesture layer as usual (press to aim, release to cast, drag to set direction); held still over 0.5 seconds with displacement ≤ 10 points = long press to rebind, cancelling this cast (judged in tickTouchControls). Holding the attack button is continuous attack, with no long press. An empty main attack button is the exception: a tap enters binding and does not send an empty A key.
 // Returns the controller key to bind for the main attack or skill button hit by this point (the second set carries ZL), or 0 if none is hit; *empty = this slot is currently empty
-- (uint64_t)skillKeyAt:(CGPoint)p empty:(BOOL *)empty {
-    if(empty) *empty=NO;
-    int i=dm_tc_bind_target_at(&_controls.layout,_controls.enabled_targets,(float)p.x,(float)p.y);   // 主攻击钮和四个技能钮共用绑定命中判定 | The main attack button and four skill buttons share one binding hit test
-    if(i!=DM_TC_NONE) { const dm_tc_target *t=&_controls.layout.target[i];
-        dm_tg_snapshot n=_overlay.nativeMapping; uint64_t now_ns(void);
-        dm_ta_glyph g=dm_ta_current_set(&n,t->button,now_ns(),_controls.skill_set); *empty=g.status==DM_TA_EMPTY;   // 与画十字用同一份读数（DmTouchOverlay） | Same reading as used for drawing the cross (DmTouchOverlay)
-        return t->button|(_controls.skill_set?DM_BTN_ZL:0); }
-    return 0;
+// 空技能位每拍同步给手势层：与「画十字」共用同一份游戏读数（dm_ta_current_set_shown），
+// 这样「画着＋」和「点一下进绑定」永远是同一个判断，不再各读一份、各得一个答案。
+// 拖到空白处留下的 manual_empty 是本地显示用的，两条路在 target_empty 里取并集。
+// Publish the empty skill slots to the gesture layer every tick: the same game reading that draws the
+// cross (dm_ta_current_set_shown) is used, so "shows ＋" and "a tap enters binding" are always one and
+// the same decision instead of two readings that can disagree. The manual_empty left by dragging onto
+// blank space is for the local display, and the two paths are unioned in target_empty.
+- (void)syncEmptySkillTargets {
+    uint32_t mask=0; const dm_tg_snapshot n=_overlay.nativeMapping; uint64_t now_ns(void);
+    for(int i=0;i<5;i++) {
+        const dm_tc_target *t=&_controls.layout.target[DM_TC_MAIN+i];
+        if(dm_ta_slot_empty(&n,t->button,now_ns(),_controls.skill_set,t->manual_empty)) mask|=1u<<(DM_TC_MAIN+i);
+    }
+    dm_tc_set_empty_targets(&_controls,mask);
 }
 // 右上角小地图 = 地图入口（地图在右上角；不要顶部图标 → 不画任何东西）。矩形取游戏自己的 AutoMap 面板（宿主每半秒读一次，面板关着时沿用最近一次）。
 // 点击区只是矩形顶部区域名那一条（全宽 × 高 1/4，不足 30 点补到 30、不超过矩形高的 0.4），不是整块（线上「小地图消失」：整块矩形占屏宽 1/3 × 屏高 1/3，
@@ -452,6 +459,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
         if (t >= 1 && t <= 3) { static UIImpactFeedbackGenerator *g[4]; if (!g[t]) g[t] = [[UIImpactFeedbackGenerator alloc] initWithStyle:t == 1 ? UIImpactFeedbackStyleHeavy : t == 2 ? UIImpactFeedbackStyleMedium : UIImpactFeedbackStyleLight];
             [g[t] impactOccurred]; LOG("掉落震动：前端震第 %d 档", t); } }
     dm_tc_set_tap_box(dm_ui_tap_box()); dm_tc_set_cur_stack(dm_ui_cur_stack_id()); dm_tc_set_hover_unid(dm_ui_hover_unid());
+    [self syncEmptySkillTargets];   // 空技能位与「画十字」共用一份读数，每拍同步给手势层 | Empty skill slots share one reading with the cross drawing and are published to the gesture layer every tick
     { dm_hud_info hi; dm_hud_get(&hi); dm_tc_set_holding(&_controls,hi.valid && hi.holding && !dm_ui_targeting()); }   // 鉴定态下游戏的「手上物品」是那张卷轴 / 那本书，但它没在手上：不算拿着 | In identify mode the game's "item in hand" is that scroll / tome, but it is not actually in hand: not counted as holding
     if(_itemAsked && _controls.navigation_mode && _controls.pointer_slot>=0) { int ir=dm_ui_item_result(_itemSeq); if(ir>=0) { _itemAsked=NO; _itemKind=ir; dm_tc_pointer_item(&_controls,ir); } }   // 命中答案一出来就告诉手势层（物品区才驱动手柄光标、才算拖放） | Tell the gesture layer as soon as the hit answer arrives (only the item area drives the controller cursor and counts as drag and drop)
     if(_pendEnd) {   // 挂着的抬起：判类与松手落点的答案都回了就结束这根手指；0.25 秒还不回就照旧按没答上处理 | Pending lift: end this finger once both the classification and the release drop-point answers are back; if still not back after 0.25 seconds, handle as no answer as before
@@ -532,6 +540,15 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
     (void)e;
     [self sweepEndedSlots];
+    /* 宿主在游戏线程发布导航态，UIKit 的 navigationMode: 回调通过主队列异步到达。
+       绑定技能的最后一步会让面板关闭并立即回到游戏态；若玩家紧接着点击第二个
+       空槽，这根手指可能先于异步回调到达，旧逻辑会把它当作面板指针而丢掉绑定请求。
+       触摸开始是所有新手指进入状态机的唯一入口，这里先用宿主发布值同步一次，
+       让这根手指按当前页面身份处理。异步回调随后到达时同值会直接返回。 */
+    { int published = atomic_load(&g_touch_navigation); if (_navigation != published) {
+        LOG("前端：触摸前同步导航态 %d -> %d", _navigation, published);
+        [self navigationMode:published];
+    } }
     // 手柄模式下碰屏幕 = 回触屏模式（dm_gamepad.m），这一下只做这一件事：此刻屏上是手柄版界面，触屏控件还没显示出来（布局重载要几十帧），
     // 照常往下走的话，落点正好在看不见的回城钮 / 技能钮位置就会直接回城、放技能，面板态还会对手柄版面板发点击。
     // Touching the screen in controller mode = back to touch mode (dm_gamepad.m), and this touch does that one thing only: at this moment the

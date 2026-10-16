@@ -136,6 +136,38 @@ int dm_tc_bind_target_at(const dm_tc_layout *l, uint32_t enabled_targets, float 
     return target;
 }
 
+void dm_tc_set_empty_targets(dm_tc_state *s, uint32_t mask) {
+    if (!s) return;
+    /* 只留主攻击 / 四个技能位那几位（DM_TC_MAIN=0 .. DM_TC_SKILL4），别把摇杆 / 腰带 / 回城那几位带进来。 */
+    /* Keep only the bits of the main attack / four skill positions (DM_TC_MAIN=0 .. DM_TC_SKILL4) and never
+       let the stick / belt / town portal bits in. */
+    s->empty_targets = mask & ((1u << (DM_TC_SKILL4 + 1)) - 1u);
+}
+
+/* 这个位现在是不是空的：本地拖空的（manual_empty）或游戏自己报的空（empty_targets）都算。
+   两者取并集，是因为它们来自两条不同的路——拖到空白处只改本地显示，游戏里删掉技能只改游戏读数；
+   只要有一条说空，玩家看到的就是「＋」，那一下就必须进绑定。
+   不带页面条件：绑定在技能树还开着的时候就会回来，那一下必须照样把位恢复。 */
+/* Is this slot empty right now: locally emptied by a drag (manual_empty) or reported empty by the game
+   (empty_targets). They are unioned because they come from two different paths -- dragging onto blank
+   space only changes the local display, and deleting a skill in the game only changes the game reading;
+   as soon as either says empty the player sees 「＋」, so that tap must enter binding.
+   It carries no page condition: a binding completes while the skill tree is still open, and the slot must
+   still be restored then. */
+static int slot_empty(const dm_tc_state *s, int target) {
+    if (target < DM_TC_MAIN || target > DM_TC_SKILL4) return 0;
+    return s->layout.target[target].manual_empty || (s->empty_targets & (1u << target)) != 0;
+}
+
+/* 输入用的空位判定：空位只存在于游戏态。面板态下主攻击 / 技能位上是五个虚拟手柄圆钮
+   （确认 / 返回 / 操作 / 绑定 / 下一页），它们不是空技能位，把键清零会让面板里的圆钮全失效。 */
+/* The empty-slot decision for input: empty slots exist only in game mode. In panel state the main attack /
+   skill positions hold the five virtual controller round buttons (confirm / back / action / bind / next
+   page); they are not empty skill slots, and zeroing the key would break every round button in panels. */
+static int target_empty(const dm_tc_state *s, int target) {
+    return !s->navigation_mode && slot_empty(s, target);
+}
+
 void dm_tc_set_key_position(dm_tc_state *s, int target, float x, float y) {
     if (!s || target < DM_TC_MAIN || target > DM_TC_SKILL4 || !isfinite(x) || !isfinite(y)) return;
     float w=s->layout.width,h=s->layout.height; if (!(w>0 && h>0)) return;
@@ -159,7 +191,12 @@ int dm_tc_mark_key_bound(dm_tc_state *s, uint64_t key_mask) {
     uint64_t button = key_mask & ~DM_BTN_ZL;
     for (int target = DM_TC_MAIN; target <= DM_TC_SKILL4; ++target) {
         if (s->layout.target[target].button != button) continue;
-        if (!s->layout.target[target].manual_empty) return DM_TC_NONE;
+        if (!slot_empty(s, target)) return DM_TC_NONE;   /* 恢复不带页面条件：绑定在技能树还开着时就回来了 | The restore carries no page condition: a binding comes back while the skill tree is still open */
+        /* 游戏里删掉的技能只在 empty_targets 里，位也一起清：不清的话下一次触摸
+           又会把这个位当空位，把一次正常施放吞成绑定。 | A skill deleted inside the game is only in
+           empty_targets, so clear that bit too: otherwise the next touch would treat this slot as empty
+           again and swallow a normal cast into a binding. */
+        s->empty_targets &= ~(1u << target);
         dm_tc_set_key_empty(s, target, 0);
         ++s->layout_edit_seq;
         update(s);
@@ -284,7 +321,7 @@ static void update(dm_tc_state *s) {
     for (int i = 0; i < DM_TC_MAX_TOUCH; ++i) {
         dm_tc_finger *f = &s->finger[i];
         if (f->active && !f->layout_editing && !f->aim_cancelled && f->target >= 0 && f->target < DM_TC_COUNT) {
-            uint64_t b = s->layout.target[f->target].manual_empty ? 0 :
+            uint64_t b = target_empty(s, f->target) ? 0 :
                          (f->target==DM_TC_PORTAL && s->portal_pending ? DM_BTN_ZL : s->layout.target[f->target].button);
             /* 拖动定方向（核心手势）。技能钮：按下后先等 DM_TC_AIM_SETTLE_S 看是点按还是拖动——拖过死区就带着右轴方向立刻键下，
                没拖到点也键下（点按 = 原版自动选目标 / 朝向）；否则键先下、右轴后偏，按下那一发朝的是旧朝向。
@@ -723,7 +760,7 @@ void dm_tc_end_at(dm_tc_state *s, int slot, double now_s) {
        由前端取走并让宿主打开技能树。这里使用宽容的独立阈值；战斗技能仍使用
        更短的点按阈值。请求只能保留一个，因为原生绑定框一次只接受一个目标键。 */
     if (!s->navigation_mode && !s->bind_request && skill_target(done.target) &&
-        s->layout.target[done.target].manual_empty &&
+        target_empty(s, done.target) &&
         now_s - done.start_time_s <= DM_TC_EMPTY_SLOT_TAP_S &&
         hypotf(done.x - done.aim_origin_x, done.y - done.aim_origin_y) <= DM_TC_EMPTY_SLOT_MOVE_PT * scale_for(&s->layout)) {
         s->bind_request = s->layout.target[done.target].button | (s->skill_set ? DM_BTN_ZL : 0);
@@ -796,7 +833,7 @@ void dm_tc_end_at(dm_tc_state *s, int slot, double now_s) {
        Skill button: hold = continuous cast, drag sets the direction, release lifts the key; no longer "hold to aim, release to cast once".
               The only thing to make up: the tap was too short and the finger lifted before the key could go down (shorter than the tap / drag decision time, or in the second set ZL has not led long enough) -- make it up as one pulse with direction;
               in the second set, when ZL has not led long enough, this pulse is delayed until it has (dm_tc_tick). */
-    if (done.active && done.target >= DM_TC_SKILL1 && done.target <= DM_TC_SKILL4 && !s->layout.target[done.target].manual_empty && !done.aim_cancelled && !s->navigation_mode
+    if (done.active && done.target >= DM_TC_SKILL1 && done.target <= DM_TC_SKILL4 && !target_empty(s, done.target) && !done.aim_cancelled && !s->navigation_mode
         && (!done.key_down || now_s - done.key_down_s < DM_TC_KEY_MIN_S || (s->skill_set && now_s - done.start_time_s < DM_TC_ZL_LEAD_S))) {   /* 键没按下过，或按下不到 2 帧（游戏可能漏读）：补成脉冲 | The key was never pressed, or was pressed for less than 2 frames (the game may miss it): make it up as a pulse */
         float ux = 0, uy = 0; int has = aim_dir(s, &done, &ux, &uy);
         s->pulse_rx = has ? (int32_t)lroundf(ux*DM_STICK_MAX) : 0; s->pulse_ry = has ? (int32_t)lroundf(-uy*DM_STICK_MAX) : 0;

@@ -89,6 +89,57 @@ int main(void) {
       dm_ui_key_pulse(0x40, 1000); CHECK(dm_ui_auto_buttons() == 0x40, "触摸按钮的键脉冲在途：替按键里有这颗键");
       dm_ui_auto_mode_leave(); CHECK(dm_ui_auto_buttons() == 0, "切换清理后在途的键脉冲作废");
       dm_ui_cache_mode_leave(); CHECK(1, "界面缓存清理在没有界面根时不崩"); }
+    { void dm_test_bind_hit(int, float, float); void dm_ui_bind_begin(uint64_t); int dm_ui_bind_skill_hit(float *, float *); void dm_ui_bind_cancel(void);
+      float nx = 0, ny = 0; dm_test_bind_hit(1, .25f, .5f);
+      CHECK(dm_ui_bind_skill_hit(&nx, &ny) == 1, "绑定前可读到技能命中");
+      dm_ui_bind_begin(0x20);
+      CHECK(dm_ui_bind_skill_hit(&nx, &ny) == 0, "新一轮绑定清理上一轮技能命中");
+      dm_ui_bind_cancel(); }
+    { void dm_test_bind_complete(uint64_t, int); void dm_ui_bind_begin(uint64_t); uint64_t first = DM_BTN_A, second = DM_BTN_X;
+      dm_tc_state s; dm_tc_init(&s, 956, 440); dm_tc_set_key_empty(&s, DM_TC_MAIN, 1); dm_tc_set_key_empty(&s, DM_TC_SKILL2, 1);
+      float mx = s.layout.target[DM_TC_MAIN].x, my = s.layout.target[DM_TC_MAIN].y;
+      float sx = s.layout.target[DM_TC_SKILL2].x, sy = s.layout.target[DM_TC_SKILL2].y;
+      dm_tc_begin_at(&s, 0, mx, my, 10.0); dm_tc_end_at(&s, 0, 10.1);
+      CHECK(dm_tc_take_bind_request(&s) == first, "异步链路：第一个空槽产生请求");
+      dm_ui_bind_begin(first); dm_tc_set_navigation_mode(&s, 1);
+      CHECK(dm_ui_bind_active() != 0, "异步链路：宿主进入绑定态");
+      dm_test_bind_complete(first, 0);
+      CHECK(dm_ui_bind_take_completed() == first, "异步链路：宿主完成通知可消费");
+      CHECK(dm_tc_mark_key_bound(&s, first) == DM_TC_MAIN, "异步链路：第一个空槽恢复");
+      dm_tc_set_navigation_mode(&s, 0);
+      dm_tc_begin_at(&s, 0, sx, sy, 11.0); dm_tc_end_at(&s, 0, 11.1);
+      CHECK(dm_tc_take_bind_request(&s) == second, "异步链路：回到游戏态后第二个空槽仍产生请求");
+      dm_ui_bind_begin(second); dm_tc_set_navigation_mode(&s, 1); dm_test_bind_complete(second, 0);
+      CHECK(dm_ui_bind_take_completed() == second, "异步链路：第二个完成通知不被第一轮残留吞掉");
+      CHECK(dm_tc_mark_key_bound(&s, second) == DM_TC_SKILL2, "异步链路：第二个空槽恢复");
+      dm_tc_set_navigation_mode(&s, 0); }
+    { /* 玩家在游戏里删掉技能留下的空位（不是拖到空白处留下的）：前端每拍把游戏读数写进
+         empty_targets，点一下必须进绑定，绑完那一位立刻不再算空位（下一次是正常施放）。
+         这一段覆盖真机症状：画着「＋」但点下去被当成一次什么都不做的施放。 */
+      /* Slots the player emptied inside the game (not left by dragging onto blank space): the front end
+         writes the game reading into empty_targets every tick, a tap must enter binding, and once bound the
+         slot stops counting as empty (the next tap is an ordinary cast). This covers the real-device symptom:
+         it shows 「＋」 but the tap is treated as a cast that does nothing. */
+      dm_tc_state s; dm_tc_init(&s, 956, 440);
+      dm_tc_set_empty_targets(&s, (1u<<DM_TC_SKILL1)|(1u<<DM_TC_SKILL2)|(1u<<DM_TC_SKILL3)|(1u<<DM_TC_SKILL4));
+      CHECK(!s.layout.target[DM_TC_SKILL2].manual_empty, "游戏里删出的空位没有本地拖空标记");
+      float sx = s.layout.target[DM_TC_SKILL2].x, sy = s.layout.target[DM_TC_SKILL2].y;
+      dm_tc_begin_at(&s, 0, sx, sy, 20.0); dm_tc_end_at(&s, 0, 20.15);
+      CHECK(dm_tc_take_bind_request(&s) == DM_BTN_X, "游戏里删出的空位点一下进绑定");
+      CHECK(dm_tc_mark_key_bound(&s, DM_BTN_X) == DM_TC_SKILL2, "游戏里删出的空位绑完恢复");
+      CHECK(!(s.empty_targets & (1u<<DM_TC_SKILL2)), "绑完这一位不再算空位");
+      dm_tc_begin_at(&s, 0, sx, sy, 21.0); dm_tc_tick(&s, 21.09);
+      CHECK(s.buttons == DM_BTN_X, "绑完再点它是正常施放、发按键");
+      dm_tc_end_at(&s, 0, 21.2);
+      CHECK(dm_tc_take_bind_request(&s) == 0, "绑完再点它不再产生绑定请求");
+      float qx = s.layout.target[DM_TC_SKILL3].x, qy = s.layout.target[DM_TC_SKILL3].y;
+      dm_tc_begin_at(&s, 0, qx, qy, 22.0); dm_tc_end_at(&s, 0, 22.15);
+      CHECK(dm_tc_take_bind_request(&s) == DM_BTN_Y, "剩下的空位照旧进绑定");
+      /* 面板态同样的位置是五个虚拟手柄圆钮，不能被当成空技能位清零。 */
+      dm_tc_set_navigation_mode(&s, 1);
+      dm_tc_begin_at(&s, 0, qx, qy, 23.0); dm_tc_tick(&s, 23.09);
+      CHECK(s.buttons == DM_BTN_Y, "面板态圆钮不受空位读数影响");
+      dm_tc_end_at(&s, 0, 23.2); }
     printf("== touch host %d 项，失败 %d ==\n", checks, fails);
     return fails != 0;
 }

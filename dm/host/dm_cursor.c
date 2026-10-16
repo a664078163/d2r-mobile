@@ -708,6 +708,15 @@ static void bd_note_skill(module_t *m, uint64_t root, int x, int y) {
     atomic_store(&g_bd_hit, kind | ((uint64_t)(x * 65535ll / w) << 16) | (uint64_t)(y * 65535ll / h));
 }
 int dm_ui_bind_skill_hit(float *nx, float *ny) { uint64_t v = atomic_load(&g_bd_hit); if (!(v >> 63)) return 0;   /* 返回 1 = 技能图标，2 = 属性「+」 | Returns 1 = skill icon, 2 = attribute "+" */ *nx = ((v >> 16) & 0xffff) / 65535.0f; *ny = (v & 0xffff) / 65535.0f; return (v >> 62) & 1 ? 2 : 1; }
+#ifdef DM_TEST_BINDING_HOOKS
+void dm_test_bind_hit(int kind, float nx, float ny) {
+    uint64_t v = 1ull << 63;
+    if (kind == 2) v |= 1ull << 62;
+    v |= ((uint64_t)(nx * 65535.0f) & 0xffff) << 16;
+    v |= (uint64_t)(ny * 65535.0f) & 0xffff;
+    atomic_store(&g_bd_hit, v);
+}
+#endif
 static int inside_walk(uint64_t w, uint64_t xy, int dep, uint64_t vt_catch) {
     if (!w || dep > 14 || !*(uint8_t *)(w + 0x50)) return 0;
     uint64_t ch = *(uint64_t *)(w + 0x58), n = *(uint64_t *)(w + 0x60), vt = *(uint64_t *)w;
@@ -1651,10 +1660,19 @@ static uint64_t ui_find(uint64_t w, const char *name, int dep);
 // Whether a panel is open is read from the widget tree (name + visible flag), checked every 6 frames; each step has a frame limit, and on timeout it gives up and logs.
 static _Atomic uint64_t g_bd_key, g_bd_completed; static _Atomic int g_bd_state;   // 0 无 1 开技能树 5 找页 2 等点技能 3 框里按键 4 关面板 | 0 none 1 open skill tree 5 find page 2 wait for skill tap 3 press key in box 4 close panel
 static _Atomic int g_bd_stay;
-void dm_ui_bind_begin(uint64_t key_mask) { if (!key_mask) return; atomic_store(&g_bd_completed, 0); atomic_store(&g_bd_key, key_mask); atomic_store(&g_bd_stay, 0); atomic_store(&g_bd_state, 1); }
+static void bd_clear_hit(void) { atomic_store(&g_bd_hit, 0); atomic_store(&g_bd_hit_id, 0); dm_wref_set(&g_bd_hit_ref, 0); }
+void dm_ui_bind_begin(uint64_t key_mask) { if (!key_mask) return; bd_clear_hit(); atomic_store(&g_bd_completed, 0); atomic_store(&g_bd_key, key_mask); atomic_store(&g_bd_stay, 0); atomic_store(&g_bd_state, 1); }
 int dm_ui_bind_active(void) { int s = atomic_load(&g_bd_state); return s == 0 ? 0 : (s == 1 || s == 5) ? 1 : s == 2 ? 2 : 3; }
-void dm_ui_bind_cancel(void) { atomic_store(&g_bd_completed, 0); atomic_store(&g_bd_state, 0); }
+void dm_ui_bind_cancel(void) { bd_clear_hit(); atomic_store(&g_bd_completed, 0); atomic_store(&g_bd_state, 0); }
 uint64_t dm_ui_bind_take_completed(void) { return atomic_exchange(&g_bd_completed, 0); }
+#ifdef DM_TEST_BINDING_HOOKS
+void dm_test_bind_complete(uint64_t key_mask, int stay) {
+    atomic_store(&g_bd_key, key_mask);
+    atomic_store(&g_bd_stay, stay != 0);
+    atomic_store(&g_bd_completed, stay ? 0 : key_mask);
+    atomic_store(&g_bd_state, stay ? 0 : 4);
+}
+#endif
 // 目标位序号 1..8（技能钮 B / X / Y / R = 1..4，第二组 +4；与游戏技能钮上的 F1–F8 一致），不在绑定态 = 0。手机层画提示字用
 // Target slot index 1..8 (skill buttons B / X / Y / R = 1..4, second set +4; matches F1–F8 on the game's skill buttons); not in the binding state = 0. Used by the phone layer to draw the hint text
 int dm_ui_bind_slot(void) { if (!atomic_load(&g_bd_state)) return 0; uint64_t k = atomic_load(&g_bd_key); int s = (k & DM_BTN_B) ? 1 : (k & DM_BTN_X) ? 2 : (k & DM_BTN_Y) ? 3 : (k & DM_BTN_R) ? 4 : 0; return s ? s + ((k & DM_BTN_ZL) ? 4 : 0) : 0; }
@@ -1870,7 +1888,7 @@ static void ui_bind_pump(uint64_t root, uint64_t fr) {
         if (!tree && fr - t0 > 30) { LOG("技能绑定：玩家关了技能树，取消"); atomic_store(&g_bd_state, 0); }
         break;
     case 3:
-        if (!modal) { if (tries) { int stay = atomic_load(&g_bd_stay); if (key != DM_BTN_MINUS && !stay) atomic_store(&g_bd_completed, key); LOG("技能绑定：%s %#llx，%s", key == DM_BTN_MINUS ? "已取消，键" : "已绑到键", (unsigned long long)key, stay ? "留在技能树" : "关功能页"); atomic_store(&g_bd_state, stay ? 0 : 4); } else if (fr - t0 > 120) atomic_store(&g_bd_state, 0); break; }
+        if (!modal) { if (tries) { int stay = atomic_load(&g_bd_stay); if (key != DM_BTN_MINUS && !stay) atomic_store(&g_bd_completed, key); bd_clear_hit(); LOG("技能绑定：%s %#llx，%s", key == DM_BTN_MINUS ? "已取消，键" : "已绑到键", (unsigned long long)key, stay ? "留在技能树" : "关功能页"); atomic_store(&g_bd_state, stay ? 0 : 4); } else if (fr - t0 > 120) atomic_store(&g_bd_state, 0); break; }
         if (fr - t0 < 12) break;   // 框开稳再按 | Press once the box has opened and settled
         if (pressed && fr - pressed < 30) break;   // 按过了：每帧看框关没关（上面），30 帧没关才重按 | Already pressed: check every frame whether the box has closed (above); re-press only if it has not closed after 30 frames
         if (tries >= 3) { LOG("【红】技能绑定：在绑定框里按了 3 次目标键 %#llx 框都没关，放弃", (unsigned long long)key); atomic_store(&g_bd_state, 0); break; }

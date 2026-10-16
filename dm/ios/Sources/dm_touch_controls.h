@@ -59,6 +59,11 @@ typedef struct {
     int joy_slot;
     float joy_origin_x, joy_origin_y;
     uint32_t enabled_targets;
+    /* 游戏自己报告为空的主攻击 / 技能位（位 = DM_TC_MAIN..DM_TC_SKILL4，前端每拍写入）。
+       空位判定与「画十字」共用这一份读数，见 dm_tc_set_empty_targets。 | Skill slots the game itself
+       reports as empty (bits = DM_TC_MAIN..DM_TC_SKILL4, written by the front end every tick). The empty
+       decision shares this one reading with the cross drawing, see dm_tc_set_empty_targets. */
+    uint32_t empty_targets;
     uint64_t buttons;
     int32_t lx, ly, rx, ry;
     int aim_slot, navigation_mode, map_cancel_active;
@@ -162,6 +167,14 @@ void dm_tc_set_edge_bottom(float bottom);   /* 屏幕底边归系统的那一条
 void dm_tc_layout_make(dm_tc_layout *layout, float width, float height);
 int dm_tc_hit(const dm_tc_layout *layout, float x, float y);
 int dm_tc_bind_target_at(const dm_tc_layout *layout, uint32_t enabled_targets, float x, float y);
+/* 游戏自己报告为空的主攻击 / 技能位（位 = DM_TC_MAIN..DM_TC_SKILL4）：前端每拍按与画十字
+   同一份游戏读数写入。空位的判定必须与「画十字」共用一份读数，否则会出现画着「＋」但
+   点下去被当成一次普通施放的裂缝（拖到空白处留下的 manual_empty 只覆盖其中一半）。
+   Skill slots the game itself reports as empty (bits = DM_TC_MAIN..DM_TC_SKILL4): written every
+   tick by the front end from the same game reading that draws the cross. The empty decision must
+   share one reading with the drawing, otherwise a slot can show 「＋」 while a tap is treated as an
+   ordinary cast (the manual_empty left by dragging onto blank space covers only the other half). */
+void dm_tc_set_empty_targets(dm_tc_state *state, uint32_t mask);
 void dm_tc_clear_key_position_overrides(void);
 void dm_tc_set_key_position_override(int target, float nx, float ny, int visible);
 int dm_tc_get_key_position_override(int target, float *nx, float *ny, int *visible);

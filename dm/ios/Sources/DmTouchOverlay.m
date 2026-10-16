@@ -21,6 +21,13 @@ static void caption(NSString *s, CGRect rect, CGFloat size, CGFloat alpha) {
 static dm_ta_glyph shown_glyph(const dm_tg_snapshot *n, uint64_t button, uint64_t now, int set) {
     static int64_t stale = -1; if (stale < 0) { const char *e = getenv("DM_TEST_OVERLAY_STALE_MS"); stale = e ? atoll(e) * 1000000ll : 0; }
     now += (uint64_t)stale;
+    // 输入层（front_ios.m 的空位判定）用同一份读数：这里的「旧了照旧画」已经搬进
+    // dm_ta_current_set_shown，两边共用，不会再出现「画着＋但点下去当成施放」的裂缝。
+    // The input layer (the empty-slot decision in front_ios.m) uses this same reading: the "if stale, draw
+    // as before" rule now lives in dm_ta_current_set_shown and is shared, so a slot can no longer show 「＋」
+    // while a tap is treated as a cast.
+    return dm_ta_current_set_shown(n, button, now, set);
+    /* 以下为原实现，保留在注释里以便对照 | The original implementation, kept for reference:
     dm_ta_glyph g = dm_ta_current_set(n, button, now, set);
     // 快照只是旧了（超过 250 毫秒没更新：游戏停拍、切后台那一瞬、长卡顿）→ 照它被取到那一刻的内容画，不退回 F 标签 / 十字——
     // 绑定没变，只是暂时没人刷新；换场景时桥会把快照清空（dm_touch_game_bridge.c），那时取到时刻为 0，仍画占位。输入层的同一读数（front_ios.m）不走这里，照旧只认新鲜的
@@ -28,6 +35,7 @@ static dm_ta_glyph shown_glyph(const dm_tg_snapshot *n, uint64_t button, uint64_
     // the binding has not changed, nobody is refreshing it for the moment; on scene change the bridge clears the snapshot (dm_touch_game_bridge.c), then the capture time is 0 and the placeholder is still drawn. The same reading in the input layer (front_ios.m) does not go through here and still accepts only fresh ones
     if (g.status == DM_TA_UNKNOWN && n && n->captured_ns && now > n->captured_ns && now - n->captured_ns > DM_TG_MAX_AGE_NS) g = dm_ta_current_set(n, button, n->captured_ns, set);
     return g;
+    */
 }
 @implementation DmTouchOverlay {
     UIImage *_circle, *_joy, *_map, *_menu, *_nativeAtlases[DM_TA_ATLASES], *_silAtlases[DM_TA_ATLASES];   // _sil：同帧位的银色剪影图集（gen_hud_v4.py） | _sil: silver silhouette atlas at the same frame positions (gen_hud_v4.py)
@@ -197,7 +205,8 @@ static void v4text(NSString *str, NSDictionary *glyphs, CGFloat x, CGFloat basel
         }
         UIImage *icon=nil; BOOL showCaption=YES; int ssKind=0, ssCharges=0;
         if(!self.navigationMode && i<=DM_TC_SKILL4) {
-            dm_ta_glyph g=t->manual_empty ? (dm_ta_glyph){.status=DM_TA_EMPTY,.reason="manual_empty"} : shown_glyph(&native,t->button,hostNow,s->skill_set);
+            BOOL slotEmpty=dm_ta_slot_empty(&native,t->button,hostNow,s->skill_set,t->manual_empty);   // 与「点空位进绑定」同一个判据 | the same predicate the empty-slot tap uses
+            dm_ta_glyph g=slotEmpty ? (dm_ta_glyph){.status=DM_TA_EMPTY,.reason=t->manual_empty?"manual_empty":"empty_slot"} : shown_glyph(&native,t->button,hostNow,s->skill_set);
             if(g.status!=DM_TA_EMPTY && g.status!=DM_TA_UNKNOWN) { int dm_swapskill_slot(int,int*); ssKind=dm_swapskill_slot(g.slot,&ssCharges); }
             icon=[self skillImage:g held:held];
             showCaption=g.status!=DM_TA_EMPTY && !icon;
@@ -291,7 +300,8 @@ static void v4text(NSString *str, NSDictionary *glyphs, CGFloat x, CGFloat basel
             entry[@"touch_enabled"]=@((s->enabled_targets&(1u<<i))!=0 && t->r>0);
         }
         if(i<=DM_TC_SKILL4) {
-            dm_ta_glyph g=t->manual_empty ? (dm_ta_glyph){.status=DM_TA_EMPTY,.reason="manual_empty"} : shown_glyph(&visualNative,t->button,hostNow,s->skill_set);
+            BOOL slotEmpty=dm_ta_slot_empty(&visualNative,t->button,hostNow,s->skill_set,t->manual_empty);   // 与「点空位进绑定」同一个判据 | the same predicate the empty-slot tap uses
+            dm_ta_glyph g=slotEmpty ? (dm_ta_glyph){.status=DM_TA_EMPTY,.reason=t->manual_empty?"manual_empty":"empty_slot"} : shown_glyph(&visualNative,t->button,hostNow,s->skill_set);
             BOOL held=t->button && (s->buttons&t->button)==t->button;
             BOOL drawn=!self.navigationMode && [self skillImage:g held:held]!=nil;
             NSString *status=self.navigationMode?@"navigation_label":(g.status==DM_TA_EMPTY?@"empty_slot":(drawn?@"current_skill":@"empty_unknown"));
