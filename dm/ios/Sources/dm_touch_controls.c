@@ -460,6 +460,9 @@ void dm_tc_cancel_all(dm_tc_state *s) {
     s->pointer_pickup_done = 0;
     s->pointer_pulse_active = s->pointer_pulse_pending = 0;
     s->pointer_pending_x = s->pointer_pending_y = 0;
+    /* 绑定请求属于当前这轮触摸事务；页面切换 / 重建触控层时不能把旧请求带到下一轮，
+       否则下一次空槽点击会被 bind_request 非零条件吞掉。 */
+    s->bind_request = 0;
 }
 
 int dm_tc_pulse_end(dm_tc_state *s, uint64_t epoch) {

@@ -543,13 +543,23 @@ static void empty_slot_tap_requests_binding(void) {
     dm_tc_set_key_empty(&s,DM_TC_MAIN,1);
     float mx=s.layout.target[DM_TC_MAIN].x, my=s.layout.target[DM_TC_MAIN].y;
     dm_tc_begin_at(&s,0,mx,my,1.0); dm_tc_move_at(&s,0,mx+13,my,1.30); dm_tc_end_at(&s,0,1.50);
-    CHECK(dm_tc_take_bind_request(&s)==DM_BTN_A);
+    CHECK(s.bind_request==DM_BTN_A);
+    /* 页面重建 / 取消触摸必须丢掉还没交给前端的旧请求，否则下一轮空槽绑定会被吞。 */
+    dm_tc_set_navigation_mode(&s,1);
     CHECK(dm_tc_take_bind_request(&s)==0);
+    dm_tc_set_navigation_mode(&s,0);
+
+    /* 两个空槽连续绑定：第一轮完成后，第二轮仍必须产生并消费自己的请求。 */
+    dm_tc_set_key_empty(&s,DM_TC_MAIN,1);
+    dm_tc_begin_at(&s,0,mx,my,1.8); dm_tc_end_at(&s,0,1.9);
+    CHECK(dm_tc_take_bind_request(&s)==DM_BTN_A);
+    CHECK(dm_tc_mark_key_bound(&s,DM_BTN_A)==DM_TC_MAIN);
 
     dm_tc_set_key_empty(&s,DM_TC_SKILL2,1); s.skill_set=1;
     float x=s.layout.target[DM_TC_SKILL2].x, y=s.layout.target[DM_TC_SKILL2].y;
     dm_tc_begin_at(&s,0,x,y,2.0); dm_tc_move_at(&s,0,x-13,y,2.20); dm_tc_end_at(&s,0,2.45);
     CHECK(dm_tc_take_bind_request(&s)==(DM_BTN_X|DM_BTN_ZL));
+    CHECK(dm_tc_mark_key_bound(&s,DM_BTN_X|DM_BTN_ZL)==DM_TC_SKILL2);
 
     dm_tc_begin_at(&s,0,x,y,3.0); dm_tc_move_at(&s,0,x+15,y,3.2); dm_tc_end_at(&s,0,3.3);
     CHECK(dm_tc_take_bind_request(&s)==0);
