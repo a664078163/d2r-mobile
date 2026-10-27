@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 enum { FMT_PCM16 = 2, STATE_STARTED = 0, STATE_STOPPED = 1, RATE = 48000 };
+static void *g_acnh_renderer_event;
 
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;     // 写进客体 AudioOutBuffer 的前 24 字节 | The first 24 bytes written into the guest AudioOutBuffer
 #define QMAX 64
@@ -206,9 +207,64 @@ static void *null_sink(void *p) {
 }
 static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
 
-// AudioOutParameter = { int32 sampleRate; uint16 channelCount; uint16 _r; ... }，0 = 系统默认（48 kHz / 2 声道）
-// AudioOutParameter = { int32 sampleRate; uint16 channelCount; uint16 _r; ... }, 0 = system default (48 kHz / 2 channels)
-HLE_FORCE("_ZN2nn5audio27InitializeAudioOutParameterEPNS0_17AudioOutParameterE", "音频输出参数默认值", void, h_au_InitParam, uint8_t *p) { memset(p, 0, 8); }
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+                  "_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm",
+                  "ACNH audren renderer：宿主无声 renderer 后端",
+                  Result, h_acnh_open_renderer, void *handle, void *event, const void *param, void *work, uint64_t size) {
+    (void)param; (void)work; (void)size;
+    g_acnh_renderer_event = event;
+    if (event) hle_bind_system_event(event, 1);
+    LOG("ACNH audren 宿主 OpenAudioRenderer event=%p", event);
+    *(uint64_t *)handle = 0xAC010001ull;
+    return RES_OK;
+}
+
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+                  "_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE",
+                  "ACNH audren renderer：宿主无声更新后端",
+                  Result, h_acnh_request_update, uint64_t handle, const void *config) {
+    (void)handle; (void)config;
+    LOG("ACNH audren 宿主 RequestUpdate");
+    return RES_OK;
+}
+
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+                  "_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE",
+                  "ACNH audren renderer：宿主无声启动后端",
+                  Result, h_acnh_start_renderer, uint64_t handle) {
+    (void)handle;
+    dm_acnh_audren_event_signal();
+    if (g_acnh_renderer_event) hle_signal_system_event(g_acnh_renderer_event);
+    LOG("ACNH audren 宿主 Start");
+    return RES_OK;
+}
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+                  "_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE",
+                  "ACNH audren renderer：宿主无声渲染后端",
+                  Result, h_acnh_execute_renderer, uint64_t handle) {
+    (void)handle;
+    dm_acnh_audren_event_signal();
+    if (g_acnh_renderer_event) hle_signal_system_event(g_acnh_renderer_event);
+    return RES_OK;
+}
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+                  "_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE",
+                  "ACNH audren renderer：宿主无声停止后端",
+                  Result, h_acnh_stop_renderer, uint64_t handle) {
+    (void)handle;
+    LOG("ACNH audren 宿主 Stop");
+    return RES_OK;
+}
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+                  "_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE",
+                  "ACNH audren renderer：宿主无声关闭后端",
+                  Result, h_acnh_close_renderer, uint64_t handle) {
+    (void)handle;
+    LOG("ACNH audren 宿主 Close");
+    g_acnh_renderer_event = NULL;
+    return RES_OK;
+}
+
 // AudioOutInfo = { char name[256] }
 HLE_FORCE("_ZN2nn5audio13ListAudioOutsEPNS0_12AudioOutInfoEi", "音频输出设备列表；宿主 1 个", int, h_au_List, char *info, int n) {
     if (n < 1) return 0;

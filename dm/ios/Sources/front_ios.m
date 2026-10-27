@@ -17,6 +17,7 @@ int dm_thermal_now(void) { return g_dm_thermal; }   // 最近的温控档位（0
 #include "dm_input.h"
 void dm_gamepad_start(void (*on_mode)(int pad)); void dm_gamepad_touched(void);   // dm_gamepad.m
 #include "hle.h"
+#include "../../host/dm_game.h"
 #import "DmTouchOverlay.h"
 #include "dm_touch_native_art.h"
 #include "dm_actions.h"
@@ -936,6 +937,34 @@ static CGRect letterbox_rect(CGRect f) {
     if (wa > ga) w = floor(h * ga); else h = floor(w / ga);   // 窗口更宽：左右留边；窗口更窄：上下留边 | Window wider: margins left and right; window narrower: margins top and bottom
     return CGRectMake(f.origin.x + floor((f.size.width - w) / 2), f.origin.y + floor((f.size.height - h) / 2), w, h);
 }
+
+// 非 D2R profile 的初始前端只提供原版画面的 Metal 输出和通用物理手柄。
+// 这些游戏的专用触屏控件、HUD 和 D2R 云存档能力不应误注入。
+@interface DmNativeGameView : UIView
+@end
+@implementation DmNativeGameView
++ (Class)layerClass { return CAMetalLayer.class; }
+- (instancetype)initWithFrame:(CGRect)frame {
+    if (!(self = [super initWithFrame:frame])) return nil;
+    self.backgroundColor = UIColor.blackColor;
+    CAMetalLayer *layer = (CAMetalLayer *)self.layer;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.contentsScale = UIScreen.mainScreen.nativeScale;
+    layer.drawableSize = CGSizeMake(frame.size.width * layer.contentsScale,
+                                   frame.size.height * layer.contentsScale);
+    g_layer = layer;
+    g_layer.device = MTLCreateSystemDefaultDevice();
+    dm_gamepad_start(NULL);
+    return self;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CAMetalLayer *layer = (CAMetalLayer *)self.layer;
+    layer.drawableSize = CGSizeMake(self.bounds.size.width * layer.contentsScale,
+                                   self.bounds.size.height * layer.contentsScale);
+}
+@end
+
 @interface DmLetterboxView : UIView
 @property (nonatomic, strong) UIView *game;
 @end
@@ -949,6 +978,7 @@ static CGRect letterbox_rect(CGRect f) {
 - (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e { UIView *h = [super hitTest:p withEvent:e]; return g_full && h == self ? self.game : h; }
 @end
 UIView *front_ios_view(CGRect frame) {
+    if (dm_game_is_acnh() || dm_game_is_d3()) return [[DmNativeGameView alloc] initWithFrame:frame];
     front_game_res(1);   // 「真全屏」开没开（g_full）是它第一次被调时按屏幕比例定的；下面摆视图要用，不能指望别处碰巧先调过 | whether "true fullscreen" is on (g_full) is decided from the screen aspect ratio the first time this is called; the view layout below needs it and cannot count on something else happening to have called it first
     CGRect full = frame; frame = letterbox_rect(frame);
     dm_tc_set_tall_scale(1);   // 真 UIKit 点数：比手机高的画面（iPad）控件等比放大 | Real UIKit points: on pictures taller than a phone's (iPad) widgets scale up proportionally
@@ -1006,10 +1036,12 @@ void front_run(void (*guest)(void)) {
     // This thread is spawned from the UIKit main thread and inherits its signal mask (measured on a real device: SIGUSR2 / SIGALRM are both blocked: the DM_SAMPLE handler never runs).
     // Guest threads need to receive the host's diagnostic signals (sampling SIGUSR2, watchdog SIGALRM), so unblock all of them; synchronous ones (SEGV / BUS / ILL / TRAP) are unaffected by the mask anyway
     sigset_t all; sigfillset(&all); pthread_sigmask(SIG_UNBLOCK, &all, NULL);
-    void uimsg_subscribe(void (*)(const char *,const char *,const char *));
-    uimsg_subscribe(touch_ui_message);
-    dm_touch_game_live_check(1);
-    if(!dm_touch_game_attach()) LOG("【红】技能绑定读取没挂上（产物没有观测门 OBS_BINDING_GETTER，或 main 模块不符）：技能键图标 / 回城键绑定不工作");   // 产品功能缺门不许静默 | A product feature missing its gate must not be silent
+    if (!dm_game_is_acnh()) {
+        void uimsg_subscribe(void (*)(const char *,const char *,const char *));
+        uimsg_subscribe(touch_ui_message);
+        dm_touch_game_live_check(1);
+        if(!dm_touch_game_attach()) LOG("【红】技能绑定读取没挂上（产物没有观测门 OBS_BINDING_GETTER，或 main 模块不符）：技能键图标 / 回城键绑定不工作");
+    }
     guest();
 }
 
@@ -1227,14 +1259,43 @@ void front_ios_focus_event(int ev) {
     static const char *k[] = {"sceneWillResignActive", "sceneDidEnterBackground", "sceneWillEnterForeground", "sceneDidBecomeActive"};
     { uint64_t guest_ns(void); LOG("前端：%s（客体时钟 %.3f s，声卡回调累计 %llu）", k[ev], guest_ns() / 1e9, (unsigned long long)dm_audio_render_calls()); }   // 两个读数：核对后台那段没算进游戏时间、回来后声卡回调继续涨 | Two readings: to check that the background period was not counted into game time and that audio device callbacks keep increasing after return
     switch (ev) {
-        case 0: [g_touch_view cancelControls]; { void dm_gamepad_reset(void); dm_gamepad_reset(); } dm_focus_set(2); resign_save(); break;   // 手柄的键和摇杆一并清零：按着键切走、在后台松开，回来不会补「松开」 | Controller buttons and sticks are zeroed as well: if a button is held while switching away and released in the background, no "release" is delivered on return
+        case 0:
+            if (dm_game_is_d2r()) [g_touch_view cancelControls];
+            { void dm_gamepad_reset(void); dm_gamepad_reset(); }
+            dm_focus_set(2);
+            if (dm_game_is_d2r()) resign_save();
+            break;
         // 进后台：客体时钟一并冻结（等效 Switch 挂起）——否则游戏线程挡在提交处、墙钟照走，回来时游戏内时间一下跳过整段后台时长（补拍 / 动画 / 冷却全跟着跳）
         // Entering background: the guest clock is frozen as well (equivalent to Switch suspend) -- otherwise the game thread is blocked at submission while the wall clock keeps running, and on return in-game time jumps over the whole background duration at once (catch-up ticks / animations / cooldowns all jump with it)
-        case 1: dm_focus_set(3); dm_ui_lifecycle(1); g_audio_bg = 1; audio_apply(); { void dm_cloud_flush(int); dm_cloud_flush(1); }   // iCloud：局内攒下的存档切后台时传掉（cloud_ios.m） | iCloud: saves accumulated in the run are uploaded when going to background (cloud_ios.m)
-            background_wait_save();   // 进后台先让游戏存一次盘并等提交完成，再挂起：手机上切出去后进程随时可能被系统回收，原版 5 分钟才自动存一次 | On entering background, first have the game save once and wait for the commit to finish, then suspend: on a phone the process may be reclaimed by the system at any time after switching away, and the original game only auto-saves every 5 minutes
-            guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); break;   // 挂起返回前在途 GPU 已清空 | In-flight GPU work is already drained before the suspend returns
-        case 2: dm_ui_lifecycle(0); { void dm_update_foreground(void); dm_update_foreground(); void dm_cloud_foreground(void); dm_cloud_foreground(); }   // 回前台时人若停在选角页，重查一次新版本（dm/host/dm_update.c；局内不查） | If the player is on the character select page when returning to foreground, check for a new version once more (dm/host/dm_update.c; not checked in a run)
-            { void dm_3d_scale_resumed(void); dm_3d_scale_resumed(); } dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); g_audio_bg = g_audio_intr = 0; audio_apply(); dm_focus_set(2); break;   // 回前台一律当打断已过：进后台时系统自己会发一次「被打断」（真机实测），却不保证回来时补发「结束」；会话若真还被占，启动声卡失败不致命、激活时重试 | Returning to foreground always treats the interruption as over: when entering background the system itself sends one "interrupted" (measured on a real device) but does not guarantee an "ended" on return; if the session is really still occupied, failing to start the audio device is not fatal and is retried on activation
+        case 1:
+            dm_focus_set(3);
+            if (dm_game_is_d2r()) dm_ui_lifecycle(1);
+            g_audio_bg = 1;
+            audio_apply();
+            if (dm_game_is_d2r()) {
+                void dm_cloud_flush(int);
+                dm_cloud_flush(1);
+                background_wait_save();
+            }
+            guest_clock_freeze_for(1, 1);
+            dm_gfx_suspend(1);
+            break;
+        case 2:
+            if (dm_game_is_d2r()) dm_ui_lifecycle(0);
+            if (dm_game_is_d2r()) {
+                void dm_update_foreground(void);
+                void dm_cloud_foreground(void);
+                dm_update_foreground();
+                dm_cloud_foreground();
+                void dm_3d_scale_resumed(void);
+                dm_3d_scale_resumed();
+            }
+            dm_gfx_suspend(0);
+            guest_clock_freeze_for(1, 0);
+            g_audio_bg = g_audio_intr = 0;
+            audio_apply();
+            dm_focus_set(2);
+            break;
         case 3: dm_focus_set(1); audio_apply(); break;   // 激活时再对一次音频：上次恢复没成（会话还被占）的在这里重试 | Reconcile audio once more on activation: a previous resume that failed (session still occupied) is retried here
     }
 }

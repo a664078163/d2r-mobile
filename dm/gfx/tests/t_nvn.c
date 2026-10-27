@@ -59,7 +59,7 @@ int main(void) {
     gpa = (PFNNVNDEVICEGETPROCADDRESSPROC)boot("nvnDeviceGetProcAddress");
     EXPECT("bootstrap 取 GetProcAddress 非空", 1, gpa != NULL);
     int nonnull = 0; for (unsigned i = 0; i < NVN_NFUNC; i++) nonnull += gpa(NULL, nvn_names[i]) != NULL;
-    EXPECT("523 个名字全部取到地址", 523, nonnull);
+    EXPECT("全部名字取到地址", NVN_NFUNC, nonnull);
     EXPECT("未知名字取址返回空", 0, gpa(NULL, "nvnNoSuchFunction") != NULL);
 
     // 2. 设备
@@ -70,6 +70,96 @@ int main(void) {
     EXPECT("uniform 缓冲对齐（X1 实测 256）", 256, v);
     P(nvnDeviceGetInteger)(&dev, NVN_DEVICE_INFO_TEXTURE_DESCRIPTOR_SIZE, &v); EXPECT("贴图描述符大小（32）", 32, v);
     P(nvnDeviceGetInteger)(&dev, NVN_DEVICE_INFO_QUEUE_COMMAND_MEMORY_MIN_SIZE, &v); EXPECT("队列命令内存下限（65536）", 65536, v);
+    EXPECT("组合贴图句柄 = 贴图号 | 采样器号 << 20", (long long)((0x100ull << 20) | 0x100ull),
+           (long long)P(nvnDeviceGetTextureHandle)(&dev, 0x100, 0x100));
+
+    // 2b. ACNH 使用标准 TextureBuilder 尺寸接口；getter 必须与 setter 保持同一份状态
+    // 2b. ACNH uses the standard TextureBuilder size API; getters must expose the same state as the setters
+    {
+        NVNtextureBuilder b; P(nvnTextureBuilderSetDevice)(&b, &dev); P(nvnTextureBuilderSetDefaults)(&b);
+        NVNtextureSwizzle sx, sy, sz, sw;
+        P(nvnTextureBuilderGetSwizzle)(&b, &sx, &sy, &sz, &sw);
+        EXPECT("TextureBuilder 默认 swizzle R", NVN_TEXTURE_SWIZZLE_R, sx);
+        EXPECT("TextureBuilder 默认 swizzle G", NVN_TEXTURE_SWIZZLE_G, sy);
+        EXPECT("TextureBuilder 默认 swizzle B", NVN_TEXTURE_SWIZZLE_B, sz);
+        EXPECT("TextureBuilder 默认 swizzle A", NVN_TEXTURE_SWIZZLE_A, sw);
+        EXPECT("TextureBuilder 默认深度模板模式", NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH,
+               P(nvnTextureBuilderGetDepthStencilMode)(&b));
+        P(nvnTextureBuilderSetSize2D)(&b, 100, 100);
+        EXPECT("SetSize2D 宽", 100, P(nvnTextureBuilderGetWidth)(&b));
+        EXPECT("SetSize2D 高", 100, P(nvnTextureBuilderGetHeight)(&b));
+        EXPECT("SetSize2D 深 = 1", 1, P(nvnTextureBuilderGetDepth)(&b));
+        P(nvnTextureBuilderSetFormat)(&b, NVN_FORMAT_RGBA8);
+        EXPECT("SetSize2D 存储尺寸", 57344, P(nvnTextureBuilderGetStorageSize)(&b));
+        P(nvnTextureBuilderSetSize3D)(&b, 7, 5, 3);
+        EXPECT("SetSize3D 宽", 7, P(nvnTextureBuilderGetWidth)(&b));
+        EXPECT("SetSize3D 高", 5, P(nvnTextureBuilderGetHeight)(&b));
+        EXPECT("SetSize3D 深", 3, P(nvnTextureBuilderGetDepth)(&b));
+        P(nvnTextureBuilderSetSwizzle)(&b, NVN_TEXTURE_SWIZZLE_B, NVN_TEXTURE_SWIZZLE_A,
+                                      NVN_TEXTURE_SWIZZLE_ONE, NVN_TEXTURE_SWIZZLE_ZERO);
+        P(nvnTextureBuilderGetSwizzle)(&b, &sx, &sy, &sz, &sw);
+        EXPECT("SetSwizzle 四通道", 0x4510, ((int)sx << 12) | ((int)sy << 8) | ((int)sz << 4) | (int)sw);
+        P(nvnTextureBuilderSetDepthStencilMode)(&b, NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL);
+        EXPECT("SetDepthStencilMode", NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL,
+               P(nvnTextureBuilderGetDepthStencilMode)(&b));
+        static const uint8_t packaged_data[] = {0xAC, 0x4E, 0x01, 0x00};
+        P(nvnTextureBuilderSetPackagedTextureData)(&b, packaged_data);
+        EXPECT("PackagedTextureData getter 保留调用方指针", (long long)(uintptr_t)packaged_data,
+               (long long)(uintptr_t)P(nvnTextureBuilderGetPackagedTextureData)(&b));
+    }
+
+    // 2b.1. ACNH 的实际临时布局：16 字节 view 后面紧邻 copyRegion。
+    //       宿主 view 状态不能越过这 16 字节边界覆盖 region。
+    // 2b.1. ACNH's real temporary layout places copyRegion immediately after a 16-byte view.
+    //       Host view state must not cross that 16-byte boundary and overwrite the region.
+    {
+        struct { uint8_t view[16]; NVNcopyRegion region; uint8_t guard[16]; } local;
+        memset(&local, 0xA5, sizeof local);
+        NVNcopyRegion want = {0, 0, 0, 4, 4, 1}; memcpy(&local.region, &want, sizeof want);
+        P(nvnTextureViewSetDefaults)((NVNtextureView *)local.view);
+        P(nvnTextureViewSetLevels)((NVNtextureView *)local.view, 2, 1);
+        EXPECT("ACNH 16 字节 view 不覆盖紧邻 copyRegion", 0, memcmp(&local.region, &want, sizeof want));
+        int base = -1, n = -1;
+        EXPECT("ACNH 16 字节 view levels 可读", 1,
+               P(nvnTextureViewGetLevels)((const NVNtextureView *)local.view, &base, &n));
+        EXPECT("ACNH 16 字节 view base level", 2, base);
+        EXPECT("ACNH 16 字节 view level count", 1, n);
+        int guard_ok = 1; for (size_t i = 0; i < sizeof local.guard; i++) guard_ok &= local.guard[i] == 0xA5;
+        EXPECT("ACNH 16 字节 view 不越过 region", 1, guard_ok);
+    }
+
+    // 2c. 游戏对象大小以游戏实际分配为准：ACNH 的 NVNtexture 只有 0x80 字节。
+    //     完整贴图状态必须在宿主堆上，初始化只能写对象里的 8 字节句柄，不能覆盖后面的哨兵。
+    // 2c. The object size is the game's actual allocation: ACNH allocates only 0x80 bytes for NVNtexture.
+    //     Complete host texture state must live on the host heap; initialization may write only the 8-byte handle and must not touch the trailing guard.
+    {
+        _Alignas(16) uint8_t objmem[0x80 + 32];
+        memset(objmem, 0xA5, sizeof objmem);
+        NVNtexture *small = (NVNtexture *)objmem;
+        NVNtextureBuilder b; P(nvnTextureBuilderSetDevice)(&b, &dev); P(nvnTextureBuilderSetDefaults)(&b);
+        P(nvnTextureBuilderSetWidth)(&b, 8); P(nvnTextureBuilderSetHeight)(&b, 4); P(nvnTextureBuilderSetFormat)(&b, NVN_FORMAT_RGBA8);
+        EXPECT("0x80 字节 NVNtexture 初始化成功", 1, P(nvnTextureInitialize)(small, &b));
+        int guard_ok = 1;
+        for (size_t i = 0x80; i < sizeof objmem; i++) guard_ok &= objmem[i] == 0xA5;
+        EXPECT("TextureInitialize 不写 0x80 字节对象之外", 1, guard_ok);
+        EXPECT("小对象句柄可查回宽", 8, P(nvnTextureGetWidth)(small));
+        P(nvnTextureFinalize)(small);
+    }
+
+    // 2d. 程序对象同样不能假设等于 NVNprogram 的保留大小。
+    // 2d. Program objects must likewise not be assumed to equal NVNprogram's reserved size.
+    {
+        _Alignas(16) uint8_t objmem[0x80 + 32];
+        memset(objmem, 0x5A, sizeof objmem);
+        NVNprogram *small = (NVNprogram *)objmem;
+        NVNshaderData sd[1]; memset(sd, 0, sizeof sd);
+        EXPECT("0x80 字节 NVNprogram 初始化成功", 1, P(nvnProgramInitialize)(small, &dev));
+        EXPECT("0x80 字节 NVNprogram 可设置着色器", 1, P(nvnProgramSetShaders)(small, 1, sd));
+        int guard_ok = 1;
+        for (size_t i = 0x80; i < sizeof objmem; i++) guard_ok &= objmem[i] == 0x5A;
+        EXPECT("ProgramSetShaders 不写 0x80 字节对象之外", 1, guard_ok);
+        P(nvnProgramFinalize)(small);
+    }
 
     // 3. 内存池：GPU 地址 = 游戏给的存储地址
     // 3. Memory pool: GPU address = the storage address given by the game
@@ -78,7 +168,53 @@ int main(void) {
     P(nvnMemoryPoolBuilderSetDevice)(&pb, &dev); P(nvnMemoryPoolBuilderSetDefaults)(&pb);
     P(nvnMemoryPoolBuilderSetStorage)(&pb, poolmem, sizeof poolmem); P(nvnMemoryPoolBuilderSetFlags)(&pb, 0x24);
     EXPECT("MemoryPoolInitialize 成功", 1, P(nvnMemoryPoolInitialize)(&pool, &pb));
+    EXPECT("MemoryPoolMap = 存储地址", (long long)(uintptr_t)poolmem,
+           (long long)(uintptr_t)P(nvnMemoryPoolMap)(&pool));
     EXPECT("池 GPU 地址 = 存储地址", (long long)(uintptr_t)poolmem, P(nvnMemoryPoolGetBufferAddress)(&pool));
+    EXPECT("MemoryPoolGetFlags 保留池标志", 0x24, P(nvnMemoryPoolGetFlags)(&pool));
+
+    // 3a. ACNH 建立一个无 CPU 存储的虚拟池；Metal 后端把其普通贴图放进私有资源，
+    //     MapVirtual 只需完成客体的虚拟内存建立阶段，映射请求布局保持不透明。
+    // 3a. ACNH creates a virtual pool without CPU storage; the Metal backend puts its ordinary
+    //     textures in private resources, so MapVirtual only completes guest setup and keeps the request opaque.
+    {
+        NVNmemoryPoolBuilder vb; NVNmemoryPool vp; uint8_t request_bytes = 0;
+        P(nvnMemoryPoolBuilderSetDefaults)(&vb);
+        P(nvnMemoryPoolBuilderSetFlags)(&vb, NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
+        EXPECT("虚拟 MemoryPoolInitialize 成功", 1, P(nvnMemoryPoolInitialize)(&vp, &vb));
+        EXPECT("虚拟池 MapVirtual 接受不透明请求", 1,
+               P(nvnMemoryPoolMapVirtual)(&vp, 1, (const NVNmappingRequest *)&request_bytes));
+        EXPECT("虚拟池没有 CPU 映射", 0, (long long)(uintptr_t)P(nvnMemoryPoolMap)(&vp));
+        P(nvnMemoryPoolFinalize)(&vp);
+    }
+
+    // 3b. 缓冲：builder 的存储区间必须原样传到对象；Map / Address 都指向池存储 + 偏移
+    // 3b. Buffer: the builder's storage range must be preserved on the object; Map / Address both point to pool storage + offset
+    {
+        NVNbufferBuilder bb; NVNbuffer buf;
+        P(nvnBufferBuilderSetDevice)(&bb, &dev);
+        P(nvnBufferBuilderSetDefaults)(&bb);
+        EXPECT("BufferBuilder 默认保留 device", 1,
+               ((NVNdevice *(*)(const NVNbufferBuilder *))proc("nvnBufferBuilderGetDevice"))(&bb) == &dev);
+        EXPECT("BufferBuilder 默认 size = 0", 0, P(nvnBufferBuilderGetSize)(&bb));
+        P(nvnBufferBuilderSetStorage)(&bb, &pool, 0x4000, 0x1000);
+        EXPECT("BufferBuilder 存储偏移", 0x4000, P(nvnBufferBuilderGetMemoryOffset)(&bb));
+        EXPECT("BufferBuilder 存储大小", 0x1000, P(nvnBufferBuilderGetSize)(&bb));
+        NVNmemoryPool builder_pool = P(nvnBufferBuilderGetMemoryPool)(&bb);
+        EXPECT("BufferBuilder 存储池按值返回同一池内容", 0,
+               memcmp(&builder_pool, &pool, sizeof pool));
+        EXPECT("BufferInitialize 成功", 1, P(nvnBufferInitialize)(&buf, &bb));
+        EXPECT("BufferMap = 池存储 + 偏移", (long long)(uintptr_t)(poolmem + 0x4000),
+               (long long)(uintptr_t)P(nvnBufferMap)(&buf));
+        EXPECT("BufferAddress = 池存储 + 偏移", (long long)(uintptr_t)(poolmem + 0x4000),
+               (long long)P(nvnBufferGetAddress)(&buf));
+        EXPECT("BufferGetSize", 0x1000, P(nvnBufferGetSize)(&buf));
+        EXPECT("BufferGetMemoryOffset", 0x4000, P(nvnBufferGetMemoryOffset)(&buf));
+        EXPECT("BufferGetMemoryPool", (long long)(uintptr_t)&pool,
+               (long long)(uintptr_t)P(nvnBufferGetMemoryPool)(&buf));
+        P(nvnBufferFinalize)(&buf);
+        EXPECT("BufferFinalize 后 Map 为空", 0, P(nvnBufferMap)(&buf));
+    }
 
     // 4. 贴图存储尺寸（块线性：GOB = 64 B × 8 行；块高按「高×1.5」取 GOB 数 ≥16→16、≥8→8 …）
     //    256×256 RGBA8：每行 1024 B = 16 GOB；高 256 行 = 32 GOB 行，块高 16 GOB → 2 块；16×2×(512×16) = 262144
@@ -217,7 +353,22 @@ int main(void) {
     EXPECT("贴图宽", 1280, P(nvnTextureGetWidth)(&sc[0]));
     NVNtexture *scp[2] = {&sc[0], &sc[1]};
     NVNwindowBuilder wb; NVNwindow win; P(nvnWindowBuilderSetDevice)(&wb, &dev); P(nvnWindowBuilderSetDefaults)(&wb);
-    P(nvnWindowBuilderSetTextures)(&wb, 2, scp); EXPECT("WindowInitialize 成功", 1, P(nvnWindowInitialize)(&win, &wb));
+    P(nvnWindowBuilderSetTextures)(&wb, 2, scp);
+    EXPECT("WindowBuilderGetNumTextures", 2,
+           ((int (*)(const NVNwindowBuilder *))proc("nvnWindowBuilderGetNumTextures"))(&wb));
+    EXPECT("WindowBuilderGetNumActiveTextures 默认等于总数", 2,
+           ((int (*)(const NVNwindowBuilder *))proc("nvnWindowBuilderGetNumActiveTextures"))(&wb));
+    ((void (*)(NVNwindowBuilder *, int))proc("nvnWindowBuilderSetNumActiveTextures"))(&wb, 1);
+    EXPECT("WindowBuilderSetNumActiveTextures 生效", 1,
+           ((int (*)(const NVNwindowBuilder *))proc("nvnWindowBuilderGetNumActiveTextures"))(&wb));
+    EXPECT("WindowInitialize 成功", 1, P(nvnWindowInitialize)(&win, &wb));
+    EXPECT("WindowGetNumTextures", 2,
+           ((int (*)(const NVNwindow *))proc("nvnWindowGetNumTextures"))(&win));
+    EXPECT("WindowGetNumActiveTextures 初始化保留", 1,
+           ((int (*)(const NVNwindow *))proc("nvnWindowGetNumActiveTextures"))(&win));
+    ((void (*)(NVNwindow *, int))proc("nvnWindowSetNumActiveTextures"))(&win, 2);
+    EXPECT("WindowSetNumActiveTextures 生效", 2,
+           ((int (*)(const NVNwindow *))proc("nvnWindowGetNumActiveTextures"))(&win));
     int idx[4];
     for (int f = 0; f < 4; f++) {
         P(nvnWindowAcquireTexture)(&win, &s2, &idx[f]);
@@ -264,13 +415,49 @@ int main(void) {
         NVNtexture tb; NVNpackagedTextureLayout lay = {{1, 0, 0, 0, 7, 0, 1, 0}};
         P(nvnTextureBuilderSetDefaults)(&b); P(nvnTextureBuilderSetWidth)(&b, 16); P(nvnTextureBuilderSetHeight)(&b, 8); P(nvnTextureBuilderSetFormat)(&b, NVN_FORMAT_RGBA8);
         P(nvnTextureBuilderSetPackagedTextureLayout)(&b, &lay); P(nvnTextureBuilderSetStorage)(&b, &rp, 0x10000); P(nvnTextureInitialize)(&tb, &b);
-        nvn_texdesc dd = ((tex_t *)&tb)->d;
+        nvn_texdesc dd = CTX(&tb)->d;
         if (nvn_swizzle(&dd, 0, 0, lin, 64, rb + 0x10000)) { printf("nvn_swizzle 失败\n"); g_fail++; }
         NVNcopyRegion s2 = {3, 2, 0, 9, 5, 1}; uint8_t g2[9 * 5 * 4];
         P(nvnTextureReadTexels)(&tb, NULL, &s2, g2);
         bad = 0; for (int y = 0; y < 5; y++) for (int x = 0; x < 9; x++) for (int c = 0; c < 4; c++) bad += g2[(y * 9 + x) * 4 + c] != PX(x + 3, y + 2, c);
         EXPECT("ReadTexels 预排布贴图 9x5（池内存块线性直读）", 0, bad);
         P(nvnMemoryPoolFinalize)(&rp);
+    }
+
+    // 6b.1 CPU 纹理写入：普通私有 MTLTexture 不能只写 NVN 存储，Flush 还必须把游戏直接改过的池内容同步到 GPU。
+    // 6b.1 CPU texture writes: a normal private MTLTexture cannot be updated by changing only NVN storage; Flush must also upload direct pool edits to the GPU.
+    {
+        NVNtextureBuilder b; NVNtexture priv; P(nvnTextureBuilderSetDevice)(&b, &dev); P(nvnTextureBuilderSetDefaults)(&b);
+        P(nvnTextureBuilderSetWidth)(&b, 8); P(nvnTextureBuilderSetHeight)(&b, 4); P(nvnTextureBuilderSetFormat)(&b, NVN_FORMAT_RGBA8);
+        P(nvnTextureInitialize)(&priv, &b);
+        uint8_t zero[8 * 4 * 4] = {0}, src[2 * 40], got[8 * 4 * 4];
+        NVNcopyRegion all = {0, 0, 0, 8, 4, 1}, sub = {2, 1, 0, 4, 2, 1};
+        memset(src, 0xEE, sizeof src);
+        for (int y = 0; y < 2; y++) for (int x = 0; x < 4; x++) for (int c = 0; c < 4; c++)
+            src[y * 40 + x * 4 + c] = (uint8_t)(0x30 + y * 19 + x * 5 + c);
+        P(nvnTextureWriteTexels)(&priv, NULL, &all, zero);
+        P(nvnTextureWriteTexelsStrided)(&priv, NULL, &sub, src, 40, 80);
+        P(nvnTextureFlushTexels)(&priv, NULL, &sub);
+        memset(got, 0xEE, sizeof got); P(nvnTextureReadTexels)(&priv, NULL, &all, got);
+        int bad = 0; for (int y = 0; y < 4; y++) for (int x = 0; x < 8; x++) for (int c = 0; c < 4; c++) {
+            uint8_t want = x >= 2 && x < 6 && y >= 1 && y < 3 ? (uint8_t)(0x30 + (y - 1) * 19 + (x - 2) * 5 + c) : 0;
+            bad += got[(y * 8 + x) * 4 + c] != want;
+        }
+        EXPECT("私有贴图 WriteTexels + Strided + Flush 后 GPU 内容正确", 0, bad);
+        P(nvnTextureFinalize)(&priv);
+
+        static uint8_t storage[0x10000] __attribute__((aligned(16384)));
+        memset(storage, 0, sizeof storage);
+        NVNmemoryPoolBuilder pb; NVNmemoryPool pool2; NVNtexture backed;
+        P(nvnMemoryPoolBuilderSetDefaults)(&pb); P(nvnMemoryPoolBuilderSetStorage)(&pb, storage, sizeof storage); P(nvnMemoryPoolInitialize)(&pool2, &pb);
+        P(nvnTextureBuilderSetStorage)(&b, &pool2, 0); P(nvnTextureInitialize)(&backed, &b);
+        uint8_t pattern[8 * 4 * 4]; for (int y = 0; y < 4; y++) for (int x = 0; x < 8; x++) for (int c = 0; c < 4; c++)
+            pattern[(y * 8 + x) * 4 + c] = (uint8_t)(0xA0 + y * 13 + x * 3 + c);
+        nvn_swizzle(&CTX(&backed)->d, 0, 0, pattern, 32, storage);
+        P(nvnTextureFlushTexels)(&backed, NULL, &all);
+        memset(got, 0, sizeof got); P(nvnTextureReadTexels)(&backed, NULL, &all, got);
+        EXPECT("池内存直接改写后 Flush 使 GPU 内容更新", 0, memcmp(got, pattern, sizeof got));
+        P(nvnTextureFinalize)(&backed); P(nvnMemoryPoolFinalize)(&pool2);
     }
 
     // 6c. 写保护脏页：预排布贴图上传后池页只读；游戏写 → 缺页 → 标脏 → 下次使用重传；宿主 read() 直写需先 prepare
@@ -283,7 +470,7 @@ int main(void) {
         P(nvnTextureBuilderSetDevice)(&b, &dev); P(nvnTextureBuilderSetDefaults)(&b); P(nvnTextureBuilderSetWidth)(&b, 16); P(nvnTextureBuilderSetHeight)(&b, 8);
         P(nvnTextureBuilderSetFormat)(&b, NVN_FORMAT_RGBA8); P(nvnTextureBuilderSetPackagedTextureLayout)(&b, &lay);
         P(nvnTextureBuilderSetStorage)(&b, &wp, 0x10000); P(nvnTextureInitialize)(&tw, &b);
-        nvn_texdesc dd = ((tex_t *)&tw)->d;
+        nvn_texdesc dd = CTX(&tw)->d;
         uint8_t lin[16 * 8 * 4], *store = wb_ + 0x10000, *outb = wb_ + 0x20000;
         #define FILLPAT(k) for (int y = 0; y < 8; y++) for (int x = 0; x < 16; x++) for (int c = 0; c < 4; c++) lin[(y * 16 + x) * 4 + c] = (uint8_t)(x * 16 + y + (k) * 3 + c * 41)
         FILLPAT(0); nvn_swizzle(&dd, 0, 0, lin, 64, store);
@@ -307,12 +494,12 @@ int main(void) {
         char path[1024]; snprintf(path, sizeof path, "%s/t_nvn_rd_XXXXXX", getenv("TMPDIR") ? getenv("TMPDIR") : "."); int fd = mkstemp(path);   // 每用户临时目录，不写 /tmp | per-user temp directory, do not write to /tmp
         FILLPAT(2); uint8_t tmpst[sizeof lin * 4]; memset(tmpst, 0, sizeof tmpst);
         static uint8_t full[0x10000]; memcpy(full, store, sizeof full);   // 现有存储内容（块线性），把第 2 版写进副本再存文件 | existing storage contents (block-linear); write version 2 into a copy and then save it to a file
-        nvn_swizzle(&dd, 0, 0, lin, 64, full); if (write(fd, full, ((tex_t *)&tw)->L.size) < 0) g_fail++;
-        ssize_t r0 = pread(fd, store, ((tex_t *)&tw)->L.size, 0); int e0 = errno;
+        nvn_swizzle(&dd, 0, 0, lin, 64, full); if (write(fd, full, CTX(&tw)->L.size) < 0) g_fail++;
+        ssize_t r0 = pread(fd, store, CTX(&tw)->L.size, 0); int e0 = errno;
         EXPECT("不 prepare：read() 进受保护页返回 -1 且 EFAULT", 1, r0 == -1 && e0 == EFAULT);
-        dm_guest_write_prepare(store, ((tex_t *)&tw)->L.size);
-        ssize_t r1 = pread(fd, store, ((tex_t *)&tw)->L.size, 0);
-        EXPECT("prepare 后 read() 成功", (long long)((tex_t *)&tw)->L.size, r1);
+        dm_guest_write_prepare(store, CTX(&tw)->L.size);
+        ssize_t r1 = pread(fd, store, CTX(&tw)->L.size, 0);
+        EXPECT("prepare 后 read() 成功", (long long)CTX(&tw)->L.size, r1);
         close(fd); unlink(path);
         GPU_READ_EQ(2, "宿主写后重传：GPU 侧内容 = 第 2 版");
         mtl_pkg_stats(&up, &re); EXPECT("宿主写触发重传，累计 2", 2, re - re0);
@@ -427,17 +614,20 @@ int main(void) {
             snap_tick(s_at + SNAP_KEEP);
             EXPECT("退役后 SNAP_KEEP 次提交：副本已回收（序号清零）", 0, s0->serial);
             const tex_t *s2 = snap_tex(&cp);
-            EXPECT("回收后旧拷贝对象再取副本：宽 8、序号是它自己的", 8, s2->serial == ((const tex_t *)&cp)->serial ? (long long)s2->d.width : -1);
+            EXPECT("回收后旧拷贝对象再取副本：宽 8、序号是它自己的", 8, s2->serial == CTX(&cp)->serial ? (long long)s2->d.width : -1);
         }
         P(nvnTextureFinalize)(&tx); P(nvnProgramFinalize)(&pg);
     }
 
-    // 7. 未实现函数：返回 0、报红、只报一次
-    // 7. Unimplemented functions: return 0, report a failure, report only once
-    unsigned ui = 0; while (strcmp(nvn_names[ui], "nvnBufferBuilderSetDefaults")) ui++;
-    ((void (*)(void *))proc("nvnBufferBuilderSetDefaults"))(NULL); ((void (*)(void *))proc("nvnBufferBuilderSetDefaults"))(NULL);
-    EXPECT("未实现函数被调用后记为已报红", 1, g_unimpl_seen[ui] > 0);
-    EXPECT("未实现函数计数 2", 2, nvn_slot[ui].cnt);
+    // 7. 未实现函数：返回 0、报红、只报一次；从当前实现表动态挑一个真正的红桩，避免接口补齐后测试又失效。
+    // 7. Unimplemented functions: return 0, report once, and count both calls; choose a real red stub dynamically so this test survives interface additions.
+    unsigned ui = 0; while (ui < NVN_NFUNC && nvn_slot[ui].fn != (void *)nvn_unimpl_entry) ui++;
+    EXPECT("仍有未实现函数可被红桩覆盖", 1, ui < NVN_NFUNC);
+    if (ui < NVN_NFUNC) {
+        ((void (*)(void *))proc(nvn_names[ui]))(NULL); ((void (*)(void *))proc(nvn_names[ui]))(NULL);
+    }
+    EXPECT("未实现函数被调用后记为已报红", 1, ui < NVN_NFUNC && g_unimpl_seen[ui] > 0);
+    EXPECT("未实现函数计数 2", 2, ui < NVN_NFUNC ? nvn_slot[ui].cnt : 0);
 
     printf("== %d 项，失败 %d ==\n", g_n, g_fail);
     return g_fail != 0;

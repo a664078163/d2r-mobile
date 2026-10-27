@@ -3,6 +3,7 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
+#include "dm_game.h"
 #include "hle.h"
 #include <stdatomic.h>
 #include <sys/mman.h>
@@ -104,6 +105,321 @@ enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=
 
 static uint8_t g_seen[256];
 
+/*
+ * ACNH's first service-manager exchange uses TIPC rather than CMIF. The
+ * kernel normally copies the response back into the same thread-local IPC
+ * buffer, so SendSyncRequest must do that work before returning success.
+ * Keep these handles opaque: the guest only needs stable session identities
+ * until the next IPC request, while the actual service implementation is
+ * added profile by profile.
+ */
+typedef struct {
+    uint32_t handle;
+    char name[9];
+} acnh_ipc_session;
+
+static acnh_ipc_session g_acnh_sessions[64];
+static unsigned g_acnh_sessions_n;
+static pthread_mutex_t g_acnh_ipc_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_acnh_audren_event_read;
+static uint32_t g_acnh_audren_event_write;
+
+uint32_t dm_acnh_audren_event_handle(void) {
+    if (!g_acnh_audren_event_read)
+        g_acnh_audren_event_read = dm_service_event_create(0, &g_acnh_audren_event_write);
+    return g_acnh_audren_event_read;
+}
+
+void dm_acnh_audren_event_signal(void) {
+    if (g_acnh_audren_event_write)
+        dm_service_event_signal(g_acnh_audren_event_write);
+}
+
+static const char *acnh_session_name(uint32_t handle) {
+    pthread_mutex_lock(&g_acnh_ipc_lock);
+    const char *name = handle == 0x7100u ? "sm:" : "unknown";
+    for (unsigned i = 0; i < g_acnh_sessions_n; i++)
+        if (g_acnh_sessions[i].handle == handle) {
+            name = g_acnh_sessions[i].name;
+            break;
+        }
+    pthread_mutex_unlock(&g_acnh_ipc_lock);
+    return name;
+}
+
+static uint32_t acnh_session_for(const char *name) {
+    pthread_mutex_lock(&g_acnh_ipc_lock);
+    for (unsigned i = 0; i < g_acnh_sessions_n; i++)
+        if (!strncmp(g_acnh_sessions[i].name, name, sizeof g_acnh_sessions[i].name)) {
+            uint32_t h = g_acnh_sessions[i].handle;
+            pthread_mutex_unlock(&g_acnh_ipc_lock);
+            return h;
+        }
+    if (g_acnh_sessions_n >= sizeof g_acnh_sessions / sizeof g_acnh_sessions[0])
+        die("ACNH IPC 会话表满");
+    acnh_ipc_session *s = &g_acnh_sessions[g_acnh_sessions_n++];
+    s->handle = 0x7200u + g_acnh_sessions_n;
+    strncpy(s->name, name, sizeof s->name - 1);
+    s->name[sizeof s->name - 1] = 0;
+    pthread_mutex_unlock(&g_acnh_ipc_lock);
+    return s->handle;
+}
+
+int dm_acnh_ipc_is_session(uint32_t handle) {
+    if (!dm_game_is_acnh()) return 0;
+    pthread_mutex_lock(&g_acnh_ipc_lock);
+    int found = handle == 0x7100u;
+    for (unsigned i = 0; !found && i < g_acnh_sessions_n; i++)
+        found = g_acnh_sessions[i].handle == handle;
+    pthread_mutex_unlock(&g_acnh_ipc_lock);
+    return found;
+}
+
+static void acnh_tipc_reply(uint32_t *p, uint32_t move_handle, int with_move_handle) {
+    /* TLR[0x1f8] is the SDK's current-thread object pointer; do not erase it
+       while reusing the preceding IPC-buffer area. */
+    memset(p, 0, 0x1f0);
+    /* HIPC response: one raw result word, optionally preceded by a move handle. */
+    p[0] = 0;
+    p[1] = 1u | (with_move_handle ? 0x80000000u : 0u);
+    unsigned i = 2;
+    if (with_move_handle) {
+        p[i++] = 1u << 5; /* special header: one move handle */
+        p[i++] = move_handle;
+    }
+    p[i] = 0; /* Result = success */
+}
+
+static int acnh_tipc_request(uint32_t *p) {
+    uint32_t h0 = p[0], h1 = p[1];
+    uint32_t type = h0 & 0xffffu;
+    if (type < 15 || type > 31) return 0;
+
+    size_t off = 2;
+    if (h1 & 0x80000000u) {
+        uint32_t sp = p[off++];
+        if (sp & 1u) off += 2; /* send-pid descriptor */
+        off += (sp >> 1) & 0xfu; /* copy handles */
+        off += (sp >> 5) & 0xfu; /* move handles */
+    }
+    uint32_t raw_words = h1 & 0x3ffu;
+    if (type == 16) { /* RegisterClient */
+        if (raw_words != 0) return 0;
+        acnh_tipc_reply(p, 0, 0);
+        LOG("ACNH sm:TIPC RegisterClient → 成功");
+        return 1;
+    }
+    if (type == 17) { /* GetServiceHandle */
+        if (raw_words < 2) return 0;
+        char name[9] = {0};
+        memcpy(name, p + off, 8);
+        uint32_t h = acnh_session_for(name);
+        acnh_tipc_reply(p, h, 1);
+        LOG("ACNH sm:GetServiceHandle %s → %#x", name, h);
+        return 1;
+    }
+    if (type == 15) { /* TIPC close */
+        acnh_tipc_reply(p, 0, 0);
+        return 1;
+    }
+    return 0;
+}
+
+static void acnh_cmif_reply(uint32_t *p, uint32_t move_handle, int with_move_handle, int out_u16) {
+    memset(p, 0, 0x1f0);
+    unsigned i = 2;
+    p[0] = 0;
+    p[1] = (out_u16 ? 5u : 4u) | (with_move_handle ? 0x80000000u : 0u);
+    if (with_move_handle) {
+        p[i++] = 1u << 5; /* special header: one move handle */
+        p[i++] = move_handle;
+    }
+    i = (i + 3u) & ~3u; /* CMIF raw data is 16-byte aligned. */
+    p[i + 0] = 0x4f434653u; /* "SFCO" */
+    p[i + 1] = 0;           /* version */
+    p[i + 2] = 0;           /* Result = success */
+    p[i + 3] = 0;           /* token / interface id */
+    if (out_u16) p[i + 4] = 0;
+}
+
+static void acnh_cmif_reply_copy_handle(uint32_t *p, uint32_t handle) {
+    memset(p, 0, 0x1f0);
+    p[0] = 0;
+    p[1] = 4u | 0x80000000u;
+    p[2] = 1u << 1; /* special header: one copy handle */
+    p[3] = handle;
+    p[4] = 0x4f434653u; /* "SFCO" */
+    p[5] = 0;
+    p[6] = 0; /* Result = success */
+    p[7] = 0;
+}
+
+static void acnh_cmif_reply_u64(uint32_t *p, uint64_t value) {
+    memset(p, 0, 0x1f0);
+    p[0] = 0;
+    p[1] = 6u; /* SFCO header (4 words) + u64 result (2 words). */
+    p[4] = 0x4f434653u; /* "SFCO" */
+    p[5] = 0;
+    p[6] = 0; /* Result = success */
+    p[7] = 0;
+    p[8] = (uint32_t)value;
+    p[9] = (uint32_t)(value >> 32);
+}
+
+static uint64_t acnh_align_u64(uint64_t value, uint64_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static uint64_t acnh_audio_work_size(const uint32_t *raw, unsigned raw_words) {
+    /* AudioRendererParameterInternal starts after the four-word SFCI header.
+       ACNH uses the extended 0x44-byte form; the first 13 fields retain the
+       public audren layout.  Keep the calculation bounded because this is an
+       HLE sizing query, not a guest allocation request. */
+    if (raw_words < 17) return 0;
+    uint64_t sample_count = raw[5];
+    uint64_t mix_buffers = raw[6];
+    uint64_t sub_mixes = raw[7];
+    uint64_t voices = raw[8];
+    uint64_t sinks = raw[9];
+    uint64_t effects = raw[10];
+    uint64_t perf_frames = raw[11];
+    uint64_t splitter_count = raw[13];
+    uint64_t splitter_destinations = raw[14];
+    uint64_t total_mixes = sub_mixes + 1;
+    uint64_t size = acnh_align_u64(mix_buffers * 4, 0x40);
+    size += sub_mixes * 0x400;
+    size += total_mixes * 0x940;
+    size += voices * 0x3f0;
+    size += acnh_align_u64(total_mixes * 8, 0x10);
+    size += acnh_align_u64(voices * 8, 0x10);
+    size += acnh_align_u64(((sinks + sub_mixes) * 0x3c0 + sample_count * 4) *
+                           (mix_buffers + 6), 0x40);
+    size += (sinks + sub_mixes) * 0x2c0;
+    size += (effects + voices * 4) * 0x30 + 0x50;
+    /* REV3+ splitter state.  These formulas are the public Ryujinx/Yuzu
+       implementation and match the ACNH parameter shape. */
+    uint64_t n = total_mixes;
+    uint64_t node = 4 * n * n + 0x12 * n + 2 * (acnh_align_u64(n, 0x40) / 8);
+    uint64_t edge = acnh_align_u64(n * n, 0x40) / 8;
+    size += acnh_align_u64(node + edge, 0x10);
+    size += splitter_destinations * 0xe0 + splitter_count * 0x20;
+    size += acnh_align_u64(splitter_destinations * 4, 0x10);
+    size += sinks * 0x170 + (sinks + sub_mixes) * 0x280;
+    size += effects * 0x4c0 + voices * 0x100;
+    size = acnh_align_u64(size, 0x40) + 0x40;
+    if (perf_frames) {
+        size += acnh_align_u64((effects + sinks + voices + sub_mixes + 1) * 16 + 0x658,
+                               0x40) * (perf_frames + 1);
+    }
+    /* REV? supports the variadic command buffer.  The old fixed floor is a
+       safe lower bound for the startup query and keeps this path deterministic
+       until the renderer's update command is implemented. */
+    size += effects * 0x840 + sub_mixes * 0x5a38 + sinks * 0x148 +
+            splitter_destinations * 0x540 +
+            voices * (splitter_count * 0x68 + 0x2e0) +
+            ((voices + sub_mixes + effects + sinks + 0x65) << 6) + 0x3f8 + 0x7e;
+    return acnh_align_u64(size + 0x7e, 0x1000);
+}
+
+static int acnh_cmif_request(uint32_t *p, uint32_t session) {
+    uint32_t h0 = p[0], h1 = p[1];
+    size_t off = 2;
+    if (h1 & 0x80000000u) {
+        uint32_t sp = p[off++];
+        if (sp & 1u) off += 2; /* send-pid descriptor */
+        off += (sp >> 1) & 0xfu; /* copy handles */
+        off += (sp >> 5) & 0xfu; /* move handles */
+    }
+    off += ((h0 >> 16) & 0xfu) * 2; /* send statics */
+    off += ((h0 >> 20) & 0xfu) * 2; /* send buffers */
+    off += ((h0 >> 24) & 0xfu) * 3; /* receive-buffer descriptors are 3 words on AArch64 */
+    off += ((h0 >> 28) & 0xfu) * 2; /* exchange buffers */
+    unsigned raw_words = h1 & 0x3ffu;
+    if (!raw_words) return 0;
+    unsigned raw_off = (unsigned)((off + 3u) & ~3u);
+    uint32_t *raw = p + raw_off;
+    if (raw[0] != 0x49434653u) return 0; /* "SFCI" */
+    uint32_t cmd = raw[2];
+    if (cmd == 0 && session == 0x7201u) { /* hid:IApplicationService::CreateAppletResource */
+        static uint32_t hid_applet_session;
+        if (!hid_applet_session) hid_applet_session = acnh_session_for("hid:applet");
+        acnh_cmif_reply(p, hid_applet_session, 1, 0);
+        LOG("ACNH hid:CreateAppletResource → %#x", hid_applet_session);
+        return 1;
+    }
+    if (cmd == 0 && session == 0x7202u) { /* IAppletResource::GetSharedMemoryHandle */
+        static uint32_t hid_shared_handle = 0x7401u;
+        acnh_cmif_reply_copy_handle(p, hid_shared_handle);
+        LOG("ACNH hid:applet:GetSharedMemoryHandle → %#x", hid_shared_handle);
+        return 1;
+    }
+    if (session == 0x7201u && (cmd == 1 || cmd == 11 || cmd == 21 || cmd == 31 ||
+                                cmd == 100 || cmd == 101 || cmd == 102 || cmd == 103 ||
+                                cmd == 104 || cmd == 106 || cmd == 107 || cmd == 108 ||
+                                cmd == 109 || cmd == 120)) {
+        /* IHidServer activation calls used by ACNH; host input is already active. */
+        acnh_cmif_reply(p, 0, 0, 0);
+        LOG("ACNH hid command %u → 成功", cmd);
+        return 1;
+    }
+    if (cmd == 3) { /* QueryPointerBufferSize */
+        acnh_cmif_reply(p, 0, 0, 1);
+        LOG("ACNH %s:CMIF QueryPointerBufferSize → 0", session == 0x7201u ? "nvdrv" : "service");
+        return 1;
+    }
+    if (cmd == 4) { /* CloneCurrentObjectEx */
+        acnh_cmif_reply(p, session, 1, 0);
+        LOG("ACNH service %#x:CMIF CloneCurrentObjectEx → %#x", session, session);
+        return 1;
+    }
+    if (cmd == 13 && session == 0x7201u && raw_words >= 5 && raw[4] == 1) {
+        /* nvdrv #FinishInitialize / #SetGraphicsFirmwareMemoryMarginEnabled.
+           Official user processes call it with 1 at the end of nvdrv init;
+           it has no output data. */
+        acnh_cmif_reply(p, 0, 0, 0);
+        LOG("ACNH nvdrv:CMIF FinishInitialize(1) → 成功");
+        return 1;
+    }
+    if (cmd == 0 && session == 0x7201u) {
+        LOG("ACNH hid:CMIF command 0 raw_words=%u raw0=%#x raw1=%#x raw2=%#x raw3=%#x raw4=%#x raw5=%#x",
+            raw_words, raw[0], raw_words > 1 ? raw[1] : 0, raw_words > 2 ? raw[2] : 0,
+            raw_words > 3 ? raw[3] : 0, raw_words > 4 ? raw[4] : 0, raw_words > 5 ? raw[5] : 0);
+    }
+    if (session == 0x7203u && cmd == 1) {
+        const uint64_t work_size = acnh_audio_work_size(raw, raw_words);
+        acnh_cmif_reply_u64(p, work_size);
+        LOG("ACNH audren:u:GetWorkBufferSize → %#llx", work_size);
+        return 1;
+    }
+    if (session == 0x7203u && cmd == 0) {
+        static uint32_t audio_renderer_session;
+        if (!audio_renderer_session) audio_renderer_session = acnh_session_for("audren:renderer");
+        acnh_cmif_reply(p, audio_renderer_session, 1, 0);
+        LOG("ACNH audren:u:OpenAudioRenderer → %#x", audio_renderer_session);
+        return 1;
+    }
+    if (session == 0x7203u && cmd == 6) {
+        uint32_t event = dm_acnh_audren_event_handle();
+        acnh_cmif_reply_copy_handle(p, event);
+        LOG("ACNH audren:u:QuerySystemEvent → %#x", event);
+        return 1;
+    }
+    if (session == 0x7204u && cmd == 7) {
+        uint32_t event = dm_acnh_audren_event_handle();
+        acnh_cmif_reply_copy_handle(p, event);
+        LOG("ACNH audren:renderer:QuerySystemEvent → %#x", event);
+        return 1;
+    }
+    if (session == 0x7204u && (cmd == 3 || cmd == 5 || cmd == 6 || cmd == 8)) {
+        acnh_cmif_reply(p, 0, 0, cmd == 3);
+        LOG("ACNH audren:renderer command %u → 成功", cmd);
+        return 1;
+    }
+    LOG("ACNH service %#x (%s): 未实现 CMIF command %u（参数 %u 个字）",
+        session, acnh_session_name(session), cmd, raw_words - 4);
+    return 0;
+}
+
 // 已映射区间登记（MapMemory 栈、MapPhysicalMemory alias 页），QueryMemory 据此回报；SDK 靠它找空位
 // Registry of mapped ranges (MapMemory stacks, MapPhysicalMemory alias pages), QueryMemory reports from it; the SDK relies on it to find free space
 #define MAX_MAP 4096
@@ -129,6 +445,100 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     mem_init();
     if (svc_thread(num, regs)) return regs[0];
     { uint64_t svc_host_call(int, uint64_t *); if (num >= 0x80 && svc_host_call(num, regs)) return regs[0]; }   // 0x80 起：剪口约定的宿主调用（hle_tact.c） | from 0x80: host calls by cut convention (hle_tact.c)
+    if (dm_game_is_acnh()) {
+        switch (num) {
+        case 0x15: {  // CreateTransferMemory：ACNH 只把它作为 IPC 共享区句柄，宿主不需要真实内核对象
+            static uint32_t next = 0x7001;
+            regs[0] = 0; regs[1] = next++;
+            return 0;
+        }
+        case 0x13: {  // MapSharedMemory(handle, addr, size)：把 HID 共享区映射到客体地址空间
+            uint32_t handle = (uint32_t)regs[0];
+            uint64_t addr = regs[1], size = regs[2];
+            uint64_t end;
+            uint64_t lo, hi;
+            if (handle != 0x7401u || !size || (addr & 0x3fffu) || (size & 0x3fffu) ||
+                __builtin_add_overflow(addr, size, &end) ||
+                addr < (uint64_t)g_as || end > (uint64_t)g_as + RESERVE || map_find(addr, size)) {
+                LOG("ACNH MapSharedMemory 非法：句柄 %#x 地址 %#llx 大小 %#llx", handle,
+                    (unsigned long long)addr, (unsigned long long)size);
+                regs[0] = 0xD401; return 0;
+            }
+            /* macOS uses 16 KiB pages. Open the complete host-page interval even
+               though the Horizon caller's range is also expected to be aligned. */
+            lo = addr & ~0x3fffull;
+            hi = (end + 0x3fffull) & ~0x3fffull;
+            if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) {
+                LOG("ACNH MapSharedMemory mprotect 失败：%#llx+%#llx errno=%d",
+                    (unsigned long long)lo, (unsigned long long)(hi - lo), errno);
+                regs[0] = 0xD401; return 0;
+            }
+            memset((void *)addr, 0, (size_t)size);
+            map_add(addr, size, handle, 0x10 /* SharedMemory */);
+            LOG("ACNH MapSharedMemory %#x → %#llx+%#llx", handle,
+                (unsigned long long)addr, (unsigned long long)size);
+            regs[0] = 0; return 0;
+        }
+        case 0x14: {  // UnmapSharedMemory(handle, addr, size)：撤销 HID 共享区映射
+            uint32_t handle = (uint32_t)regs[0];
+            uint64_t addr = regs[1], size = regs[2];
+            int k = map_find(addr, size);
+            if (handle != 0x7401u || !k || g_map[k - 1].base != addr ||
+                g_map[k - 1].size != size || g_map[k - 1].src != handle) {
+                LOG("ACNH UnmapSharedMemory 非法：句柄 %#x 地址 %#llx 大小 %#llx", handle,
+                    (unsigned long long)addr, (unsigned long long)size);
+                regs[0] = 0xD401; return 0;
+            }
+            uint64_t lo = addr & ~0x3fffull;
+            uint64_t hi = (addr + size + 0x3fffull) & ~0x3fffull;
+            if (mprotect((void *)lo, hi - lo, PROT_NONE)) {
+                LOG("ACNH UnmapSharedMemory mprotect 失败：%#llx+%#llx errno=%d",
+                    (unsigned long long)lo, (unsigned long long)(hi - lo), errno);
+                regs[0] = 0xD401; return 0;
+            }
+            map_del(k - 1);
+            LOG("ACNH UnmapSharedMemory %#x ← %#llx+%#llx", handle,
+                (unsigned long long)addr, (unsigned long long)size);
+            regs[0] = 0; return 0;
+        }
+        case 0x1f: {  // ConnectToNamedPort：ACNH 启动期只连接 sm:，由宿主发一个不透明会话句柄
+            static uint32_t sm = 0x7100;
+            regs[0] = 0; regs[1] = sm;
+            return 0;
+        }
+        case 0x21: {  // SendSyncRequest：消息缓冲在当前线程的 TLR[0]，服务响应由 ACNH profile 处理
+            uint32_t *p = (uint32_t *)pthread_getspecific(g_keytlr);
+            if (p && regs[0] == 0x7100u && acnh_tipc_request(p)) {
+                regs[0] = 0;
+                return 0;
+            }
+            if (p && (uint32_t)regs[0] == 0x7203u &&
+                p[0] == 2u && p[1] == 0u && p[2] == 2u && p[3] == dm_acnh_audren_event_handle()) {
+                LOG("ACNH audren:u HIPC event-handle request → 成功");
+                regs[0] = 0;
+                return 0;
+            }
+            if (p && dm_acnh_ipc_is_session((uint32_t)regs[0])) {
+                if (acnh_cmif_request(p, (uint32_t)regs[0])) {
+                    regs[0] = 0;
+                    return 0;
+                }
+            }
+            LOG("【红】ACNH SendSyncRequest 未实现：会话 %#llx (%s)，消息缓冲 %p",
+                regs[0], acnh_session_name((uint32_t)regs[0]), (void *)p);
+            regs[0] = 0x2A2u;
+            return 0;
+        }
+        case 0x22: {  // SendSyncRequestWithUserBuffer：消息缓冲由 x0/x1 传入
+            LOG("【红】ACNH SendSyncRequestWithUserBuffer 未实现：会话 %#llx，缓冲 %#llx +%#llx",
+                regs[0], regs[1], regs[2]);
+            regs[0] = 0x2A2u;
+            return 0;
+        }
+        default:
+            break;
+        }
+    }
     switch (num) {
     case 0x01: {  // SetHeapSize(out_addr*, size)  → x1 = heap base
         size_t size = regs[1];
@@ -212,9 +622,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
         module_t *mm = module_of((void *)regs[30]);
         static int nb;
-        LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr);
+        uint32_t b0 = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
+        uint32_t b1 = (regs[1] && regs[2] >= 8) ? *((uint32_t *)regs[1] + 1) : 0;
+        LOG("Break#%d reason=%#llx Result=%#x ptr=%#llx size=%#llx data=%#x,%#x svc 位于 %s+%#llx", ++nb, regs[0], res,
+            regs[1], regs[2], b0, b1, mm ? mm->name : "?", orig_addr);
         dm_backtrace(regs[29]);
-        if (regs[0] & 0x80000000ull) return 0;   // 仅通知，可继续 | notification only, can continue
+        if (regs[0] & 0x80000000ull)
+            return 0;   // 仅通知，可继续
         _exit(42);
     }
     case 0x1E: regs[0] = 0; regs[1] = guest_ns() * 12 / 625; return 0;   // GetSystemTick

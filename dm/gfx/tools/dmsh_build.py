@@ -15,25 +15,38 @@
 # Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
-import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
+import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf, pathlib
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 HOME = os.path.expanduser('~')
 dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import dmsh_chain, dmsh_fetch, dmsh_facts   # 翻译链版本：先核工具与锁文件，产物进 b-<V>/ | translation chain version: verify the tools against the lock file first; build output goes into b-<V>/
-_bad = dmsh_chain.check_tools()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../tools')); import acnh_shader
+_bad = [] if os.environ.get('DMSH_SKIP_TOOL_CHECK') == '1' else dmsh_chain.check_tools()
 if _bad: sys.exit('\n'.join('【红】翻译链工具与锁文件不符：' + b for b in _bad) + '\n（换了工具就 dmsh_chain.py --update-lock 并入仓；只是没重编翻译器就重编）')
 CHAIN = dmsh_chain.version(); out = os.path.join(out, 'b-' + CHAIN)
 if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'【红】nvn/dmsh_chain.h 不是当前翻译链版本 {CHAIN}：先跑 dmsh_chain.py --header（否则宿主找不到这批库）')
-XLATE = os.environ.get('XLATE', f'{DM_ROOT}/build/gfx/dmsh_xlate/dmsh_xlate')
-FACTS = dmsh_facts.load()
-if not FACTS: sys.exit('【红】没有作答表 nvn/shader_facts.tsv（随仓库；维护者用 dmsh_facts.py --freeze 重出）')
+XLATE = os.environ.get('DMSH_XLATE') or os.environ.get('XLATE') or f'{DM_ROOT}/build/gfx/dmsh_xlate/dmsh_xlate'
+DOTNET_ROOT = os.environ.get('DOTNET_ROOT')
+if not DOTNET_ROOT:
+    dotnet = shutil.which('dotnet')
+    if dotnet:
+        rr = subprocess.run([dotnet, '--list-runtimes'], capture_output=True, text=True)
+        mm = re.search(r'^Microsoft\.NETCore\.App \S+ \[(.*)/shared/Microsoft\.NETCore\.App\]', rr.stdout, re.M)
+        if mm: os.environ['DOTNET_ROOT'] = DOTNET_ROOT = mm.group(1)
+PROFILE = os.environ.get('DMSH_PROFILE', 'd2r')
+if PROFILE not in ('d2r', 'acnh'): sys.exit(f'【红】DMSH_PROFILE 只能是 d2r 或 acnh（当前：{PROFILE}）')
+MAP = os.environ.get('DMSH_MAP') or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), '../nvn/shader_map_acnh.tsv' if PROFILE == 'acnh' else '../nvn/shader_map.tsv')
+FACTS_PATH = os.environ.get('DMSH_FACTS')
+if FACTS_PATH and not os.path.exists(FACTS_PATH): sys.exit(f'【红】指定的作答表不存在：{FACTS_PATH}')
+FACTS = dmsh_facts.load(FACTS_PATH) if FACTS_PATH else (dmsh_facts.load() if PROFILE == 'd2r' else {})
+if PROFILE == 'd2r' and not FACTS: sys.exit('【红】没有作答表 nvn/shader_facts.tsv（随仓库；维护者用 dmsh_facts.py --freeze 重出）')
 IOSOUT = os.environ.get('IOSOUT')   # 设了就同时出 iOS 版（iphoneos metallib + 反射）到该目录 | if set, also build the iOS version (iphoneos metallib + reflection) into that directory
 if IOSOUT:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
 MAIN = os.environ.get('MAIN', f'{DM_ROOT}/data/switch/3.3.94012/Update/ExeFS/main')
-MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn/shader_map.tsv')
-BF_WANT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn/bf_want.tsv')
+BF_WANT_FILE = os.environ.get('DMSH_BF_WANT') or os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn/bf_want.tsv')
 BF_WANT = {line.strip() for line in open(BF_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(BF_WANT_FILE) else set()
 XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-texture-buffer-native', '--msl-pad-fragment-output']
 CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
@@ -73,6 +86,12 @@ def source_without_rule_bodies():
 def shader_rule_source(name):
     return b''.join(inspect.getsource(f).encode() for f, applies in RULES if applies(name))
 
+def map_fingerprint():
+    """The selected profile's mapping table and any conflict table."""
+    value = hashlib.sha256(open(MAP, 'rb').read())
+    if os.path.exists(CONFLICTS): value.update(b'\0conflicts\0' + open(CONFLICTS, 'rb').read())
+    return value.hexdigest()
+
 def tool_fingerprint():
     sc = subprocess.run(['spirv-cross', '--version'], capture_output=True, text=True, timeout=30)
     return ('lock\0' + open(dmsh_chain.LOCK).read() + '\0options\0' + dmsh_chain.options() +
@@ -85,6 +104,8 @@ def shader_key(key, name, rec):
     embedded = rec if name.startswith('main.rodata@') else b''
     payload = (b'record\0' + rec + b'\0map\0' + map_row + b'\0pc\0' + pc + b'\0embedded\0' + embedded +
                b'\0tools\0' + TOOL_FP + b'\0code\0' + CODE_FP.encode() +
+               b'\0profile\0' + PROFILE.encode() + b'\0mapfp\0' + MAP_FP.encode() +
+               b'\0factsfp\0' + FACTS_FP.encode() +
                b'\0rule\0' + shader_rule_source(name))
     return hashlib.sha256(payload).hexdigest()
 
@@ -221,20 +242,26 @@ def fetch_finish(key, src, refl):
 
 pc_of, loc, stage_of = {}, {}, {}
 MAP_ROWS, MAP_CONFLICT_ROWS = {}, {}
+CONFLICTS = os.environ.get('DMSH_CONFLICTS', MAP + '.conflicts.tsv')
 for raw in open(MAP, 'rb'):
     c = raw.rstrip(b'\n').split(b'\t')
     if len(c) > 4: MAP_ROWS.setdefault(c[3].decode(), raw)
-for raw in open(MAP + '.conflicts.tsv', 'rb'):
-    c = raw.rstrip(b'\n').split(b'\t')
-    if len(c) > 1 and not raw.startswith((b'#', b'dm_')): MAP_CONFLICT_ROWS.setdefault(c[0].decode(), raw)
+if os.path.exists(CONFLICTS):
+    for raw in open(CONFLICTS, 'rb'):
+        c = raw.rstrip(b'\n').split(b'\t')
+        if len(c) > 1 and not raw.startswith((b'#', b'dm_')): MAP_CONFLICT_ROWS.setdefault(c[0].decode(), raw)
 for ln in open(MAP):
     c = ln.rstrip('\n').split('\t')
-    if len(c) > 4 and c[0].endswith('.bin'): pc_of.setdefault(c[3], c[4]); loc.setdefault(c[3], (c[0], int(c[1])))
+    if len(c) > 4 and PROFILE == 'acnh' and c[0] == 'acnh':
+        pc_of[c[3]] = c[4]; loc[c[3]] = (c[1], 0); stage_of[c[3]] = {'顶点': 'vs', '像素': 'ps', '计算': 'cs'}[c[2]]
+    elif len(c) > 4 and c[0].endswith('.bin'):
+        pc_of.setdefault(c[3], c[4]); loc.setdefault(c[3], (c[0], int(c[1]))); stage_of[c[3]] = {'顶点': 'vs', '像素': 'ps', '计算': 'cs'}.get(c[2], c[2])
     if len(c) > 4 and c[0].startswith('main.rodata@'):   # 内嵌：位置 = main 映像偏移（控制段起点），阶段取映射表第 3 列 | embedded: location = main image offset (start of the control segment), stage taken from column 3 of the mapping table
         pc_of.setdefault(c[3], c[4]); loc.setdefault(c[3], (c[0], int(c[0].split('@')[1], 16))); stage_of[c[3]] = {'顶点': 'vs', '像素': 'ps'}[c[2]]
-for ln in open(MAP + '.conflicts.tsv'):
-    c = ln.rstrip('\n').split('\t')
-    if len(c) > 1 and not ln.startswith('#') and not ln.startswith('dm_') and c[0] in pc_of: pc_of[c[0]] = c[1]
+if os.path.exists(CONFLICTS):
+    for ln in open(CONFLICTS):
+        c = ln.rstrip('\n').split('\t')
+        if len(c) > 1 and not ln.startswith('#') and not ln.startswith('dm_') and c[0] in pc_of: pc_of[c[0]] = c[1]
 
 def main_rec(mi, o):
     """内嵌着色器 → 与包内记录同布局的字节：包内记录 +0x38 起是代码区（0x30 头 + SPH + 指令，标记 78563412），紧接控制段（34127698）；
@@ -246,14 +273,32 @@ def main_rec(mi, o):
     return bytes(0x38) + mi[g:o + 0x880]
 
 def job_for(key, name, rec, w):
-    ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = stage_of.get(key, name[:2])
-    c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)   # 控制段 +0x700：c1 相对指令区起点、+0x704：指令区总长（c1 = 两者之间；全库长度 0 / 256 / 512 / 768） | control segment +0x700: c1 relative to the start of the instruction area, +0x704: total length of the instruction area (c1 = what lies between the two; lengths across the whole library are 0 / 256 / 512 / 768)
-    c1 = rec[0x38 + c1o:0x38 + c1t]
+    if PROFILE == 'acnh':
+        if len(rec) < 0x3C or rec[:8] != b'BTCDBTCD':
+            sys.exit(f'【红】{key}: ACNH 记录布局非法')
+        # acnh_shader.record() is BTCD + 0x30 marker + full code + control.
+        # The control marker is absent from one legal one-byte-code record, so
+        # use the trailing control's declared length instead of searching for
+        # a magic value.
+        try:
+            code, control = acnh_shader.split_record(rec)
+        except acnh_shader.FormatError as exc:
+            sys.exit(f'【红】{key}: ACNH 记录边界非法：{exc}')
+        c1o, c1t = struct.unpack_from('<II', control, 0x700)
+        if not 0 <= c1o <= c1t <= len(code): sys.exit(f'【红】{key}: c1 边界非法')
+        c1 = code[c1o:c1t] if c1o < c1t else b''
+        stage = stage_of[key]
+    else:
+        ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = stage_of.get(key, name[:2])
+        c1o, c1t = struct.unpack_from('<2I', rec, ci + 0x700)
+        c1 = rec[0x38 + c1o:0x38 + c1t]
     if stage != 'cs': code = code[0x30:]
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(),
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # 翻译选项（见 dmsh_xlate/Program.cs）；放宽精度缺省开（GPU 浮点末位误差不进游戏状态，mini 整帧 −26%）   # c1：翻译器读间接跳转表用 | translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
-    if key not in FACTS: j['pc_missing'] = True; return j, c1   # 作答表里没有：查询按缺省（汇总里单列） | not in the answer table: queries use defaults (listed separately in the summary)
+    if key not in FACTS:
+        j['facts_missing'] = True
+        return j, c1
     j.update(FACTS[key])
     return j, c1
 
@@ -381,6 +426,8 @@ RULES = []   # 按着色器名挂的 MSL 改写规则（函数, 适用判定）�
 # The first-stage code fingerprint does not include dmsh_fetch.py; readable-tile variants get a separate second-stage cache keyed on the generated MSL.
 CODE_FP = hashlib.sha256(source_without_rule_bodies().encode() + b''.join(b'\0' + open(m.__file__, 'rb').read() for m in (dmsh_chain,) + ((ios_metal,) if IOSOUT else ()))).hexdigest()
 TOOL_FP = tool_fingerprint().encode()
+MAP_FP = map_fingerprint()
+FACTS_FP = hashlib.sha256(open(FACTS_PATH or dmsh_facts.TABLE, 'rb').read()).hexdigest() if FACTS_PATH or os.path.exists(dmsh_facts.TABLE) else 'none'
 
 def finish(key, w, j, c1):
     name, k = loc[key]
@@ -389,13 +436,14 @@ def finish(key, w, j, c1):
     r = subprocess.run(['spirv-cross', *XC, os.path.join(w, key + '.spv'), '--output', msl], capture_output=True, text=True)
     if r.returncode: return 'MSL 失败', r.stderr.strip()[:160], None
     src = open(msl).read()
-    try:
-        subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
-        tmp_lib = lib + '.tmp-' + str(os.getpid())
-        subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', tmp_lib], check=True)
-        os.replace(tmp_lib, lib)
-    except subprocess.CalledProcessError as e:
-        return 'metal 失败', str(e)[:160], None
+    if os.environ.get('DMSH_SKIP_METAL') != '1':
+        try:
+            subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-c', msl, '-o', air], check=True)
+            tmp_lib = lib + '.tmp-' + str(os.getpid())
+            subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', tmp_lib], check=True)
+            os.replace(tmp_lib, lib)
+        except subprocess.CalledProcessError as e:
+            return 'metal 失败', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
     if IOSOUT:   # iOS：同一份 MSL 走 iOS 的唯一编译口径（dm/ios/tools/ios_metal.py）出 iphoneos metallib | iOS: the same MSL goes through iOS's single compile convention (dm/ios/tools/ios_metal.py) to produce an iphoneos metallib
         ilib = os.path.join(IOSOUT, key + '_b.metallib')
@@ -405,12 +453,14 @@ def finish(key, w, j, c1):
         except subprocess.CalledProcessError as e: return 'iOS metal 失败', str(e)[:160], None
     entry = re.search(r'(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(', src)
     dr = drv_reads(src)
-    refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': pc_of[key], 'stage': j['stage'],
+    refl = {'key': key + '_b', 'route': 'B', 'chain': CHAIN, 'dm_key': key, 'source': f'{name}#{k}', 'stage': j['stage'],
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None,
-            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['无配对 PC 反射，查询按缺省'] if j.get('pc_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
+            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['无配对 PC 反射，查询按缺省'] if j.get('facts_missing') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
             'bindings': reflect(key, j['stage'], src, res),
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
             'raster': raster_facts(j['stage'], src)}
+    if os.environ.get('DMSH_SKIP_METAL') == '1': refl['metal_compiled'] = False
+    if PROFILE == 'd2r': refl['pc_paired'] = pc_of[key]
     write_refl(key, refl)
     fetch_finish(key, src, refl)
     return 'ok', '', refl
@@ -423,7 +473,11 @@ packs, jobs, c1s = {}, {}, {}
 digests, rule_fps, cache_reasons, cache_hits = {}, {}, {}, set()
 for key in keys:
     name, k = loc[key]
-    if name.startswith('main.rodata@'):
+    if PROFILE == 'acnh':
+        if 'acnh' not in packs: packs['acnh'] = {p.name: p.read_bytes() for p in pathlib.Path(dm_dir).glob('*.bin')}
+        if key + '.bin' not in packs['acnh']: sys.exit(f'【红】ACNH 记录目录里没有 {key}.bin：{dm_dir}')
+        rec = packs['acnh'][key + '.bin']
+    elif name.startswith('main.rodata@'):
         if 'main' not in packs:
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../verify'))
             try: import nsoimg

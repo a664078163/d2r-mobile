@@ -110,6 +110,74 @@ static double psnr(const uint8_t *a, const uint8_t *b, size_t n) {
     double e = 0; for (size_t i = 0; i < n; i++) { double d = (double)a[i] - b[i]; e += d * d; }
     return e == 0 ? 99 : 10 * log10(255.0 * 255.0 / (e / n));
 }
+
+// ---------- F 区域写入：锁住 TextureWriteTexels 的数据布局契约 ----------
+// ---------- F region writes: lock down the TextureWriteTexels data-layout contract ----------
+static void region_writes(void) {
+    printf("F TextureWriteTexels 区域 / stride / 分层\n");
+    {
+        nvn_texdesc d = {1, 0x25, 0, 0, 16, 8, 1, 1, 0, 2};
+        nvn_texlayout L; nvn_tex_layout(&d, &L);
+        uint8_t *st = calloc(1, L.size + 64), src[3 * 24];
+        memset(src, 0xEE, sizeof src);
+        for (int y = 0; y < 3; y++) for (int x = 0; x < 5; x++)
+            for (int c = 0; c < 4; c++) src[y * 24 + x * 4 + c] = (uint8_t)(0x10 + y * 17 + x * 3 + c);
+        NVNcopyRegion r = {3, 2, 0, 5, 3, 1};
+        CHECK(!nvn_write_texels(&d, 0, 0, &r, src, 24, 0, st), "F 2D 块线性子区域写入失败");
+        uint8_t out[16 * 8 * 4]; memset(out, 0, sizeof out);
+        CHECK(!nvn_deswizzle(&d, 0, 0, st, out, 16 * 4), "F 2D 块线性写入后解排布失败");
+        int ok = 1;
+        for (int y = 0; y < 8; y++) for (int x = 0; x < 16; x++) for (int c = 0; c < 4; c++) {
+            uint8_t want = (x >= 3 && x < 8 && y >= 2 && y < 5) ? (uint8_t)(0x10 + (y - 2) * 17 + (x - 3) * 3 + c) : 0;
+            ok &= out[(y * 16 + x) * 4 + c] == want;
+        }
+        CHECK(ok, "F 2D 块线性子区域只改目标像素");
+        CHECK(st[L.size] == 0 && st[L.size + 63] == 0, "F 2D 区域写入不越过存储末尾");
+        free(st);
+    }
+    {
+        nvn_texdesc d = {4, 0x25, 0, 0, 8, 4, 3, 1, 0, 0};
+        nvn_texlayout L; nvn_tex_layout(&d, &L); uint8_t *st = calloc(1, L.size);
+        uint8_t src[2 * 16 * 4]; memset(src, 0xEE, sizeof src);
+        for (int z = 0; z < 2; z++) for (int y = 0; y < 2; y++) for (int x = 0; x < 3; x++)
+            for (int c = 0; c < 4; c++) src[z * 64 + y * 16 + x * 4 + c] = (uint8_t)(z * 40 + y * 11 + x * 3 + c);
+        NVNcopyRegion r = {1, 1, 1, 3, 2, 2};
+        CHECK(!nvn_write_texels(&d, 0, 0, &r, src, 16, 64, st), "F 2D 数组分层写入失败");
+        uint8_t out[8 * 4 * 4]; int ok = 1;
+        for (int z = 0; z < 3; z++) { memset(out, 0, sizeof out); CHECK(!nvn_deswizzle(&d, 0, z, st, out, 32), "F 2D 数组第 %d 层解排布失败", z);
+            for (int y = 0; y < 4; y++) for (int x = 0; x < 8; x++) for (int c = 0; c < 4; c++) {
+                uint8_t want = z >= 1 && z <= 2 && x >= 1 && x < 4 && y >= 1 && y < 3 ? (uint8_t)((z - 1) * 40 + (y - 1) * 11 + (x - 1) * 3 + c) : 0;
+                ok &= out[(y * 8 + x) * 4 + c] == want;
+            }
+        }
+        CHECK(ok, "F 2D 数组 zoffset/depth 与 image stride 正确"); free(st);
+    }
+    {
+        nvn_texdesc d = {2, 0x01, 0, 0, 5, 4, 3, 1, 0, 0};
+        nvn_texlayout L; nvn_tex_layout(&d, &L); uint8_t *st = calloc(1, L.size);
+        uint8_t src[3 * 8]; for (int z = 0; z < 3; z++) for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) src[z * 8 + y * 4 + x] = (uint8_t)(z * 30 + y * 7 + x);
+        NVNcopyRegion r = {1, 1, 0, 2, 2, 3};
+        CHECK(!nvn_write_texels(&d, 0, 0, &r, src, 4, 8, st), "F 3D 区域写入失败");
+        uint8_t out[5 * 4 * 3]; CHECK(!nvn_deswizzle(&d, 0, 0, st, out, 5), "F 3D 写入后解排布失败");
+        int ok = 1; for (int z = 0; z < 3; z++) for (int y = 0; y < 4; y++) for (int x = 0; x < 5; x++) {
+            uint8_t want = x >= 1 && x < 3 && y >= 1 && y < 3 ? (uint8_t)(z * 30 + (y - 1) * 7 + (x - 1)) : 0;
+            ok &= out[(z * 4 + y) * 5 + x] == want;
+        }
+        CHECK(ok, "F 3D z/image stride 正确"); free(st);
+    }
+    {
+        nvn_texdesc d = {1, 0x25, 0x10, 0, 7, 3, 1, 1, 32, 0};
+        nvn_texlayout L; nvn_tex_layout(&d, &L); uint8_t *st = calloc(1, L.size);
+        uint8_t src[2 * 24]; for (int y = 0; y < 2; y++) for (int x = 0; x < 4; x++) for (int c = 0; c < 4; c++) src[y * 24 + x * 4 + c] = (uint8_t)(y * 19 + x * 5 + c);
+        NVNcopyRegion r = {2, 1, 0, 4, 2, 1};
+        CHECK(!nvn_write_texels(&d, 0, 0, &r, src, 24, 0, st), "F LINEAR 区域写入失败");
+        int ok = 1; for (int y = 0; y < 3; y++) for (int x = 0; x < 7; x++) for (int c = 0; c < 4; c++) {
+            uint8_t want = x >= 2 && x < 6 && y >= 1 ? (uint8_t)((y - 1) * 19 + (x - 2) * 5 + c) : 0;
+            ok &= st[y * 32 + x * 4 + c] == want;
+        }
+        CHECK(ok, "F LINEAR 使用 texture stride 且不破坏行尾"); free(st);
+    }
+}
 // 用指定块高解一级（负对照用；越过存储的地址按 0 读）
 // Decode one level with a specified block height (for the negative control; addresses beyond the storage read as 0)
 static void deswz_tile(const uint8_t *st, uint64_t st_size, uint64_t base, uint32_t rb, uint32_t rows, unsigned th, uint8_t *out) {
@@ -188,6 +256,11 @@ static void real_pair(const char *dir, int i, const char *why) {
 }
 
 int main(int argc, char **argv) {
+    region_writes();
+    if (argc > 1 && !strcmp(argv[1], "--region-only")) {
+        printf("F：%s（%d 项）\n", fails ? "红" : "全过", checks);
+        return fails != 0;
+    }
     printf("A 往返（随机数据，非 2 的幂尺寸）\n");
     roundtrip("2D 100×37 R8 4 级", 1, 0x01, 100, 37, 1, 4);
     roundtrip("2D 100×37 RG8 4 级", 1, 0x0D, 100, 37, 1, 4);

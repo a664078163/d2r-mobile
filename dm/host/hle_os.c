@@ -7,6 +7,20 @@
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 
+/*
+ * The Switch SDK implementation emits privileged ARM cache-maintenance
+ * instructions.  They are not legal in the macOS host process; guest memory
+ * is ordinary host memory here and the host compiler/runtime already provides
+ * the required visibility.  ACNH reaches this symbol while publishing its
+ * resource buffers, so keep the ABI boundary but make the operation a no-op.
+ */
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+    "_ZN2nn2os14FlushDataCacheEPKvm",
+    "ACNH 客体缓存刷新；宿主内存不执行特权 cache 指令",
+    void, h_os_FlushDataCache, const void *p, size_t n) {
+    (void)p; (void)n;
+}
+
 // ---------- 旁表 ----------
 // ---------- Side table ----------
 #define OM_SIZE (1u << 18)

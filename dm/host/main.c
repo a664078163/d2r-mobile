@@ -1,6 +1,7 @@
 // 引导：装模块后，照 SDK 里 nn::init::Start（sdk+0x2b0470）的真实顺序初始化 SDK 运行时，再进 nnMain。
 // Bootstrap: after loading the modules, initialize the SDK runtime in the real order of nn::init::Start (sdk+0x2b0470) in the SDK, then enter nnMain.
 #include "dm.h"
+#include "dm_game.h"
 #include "front.h"
 #include <stdatomic.h>
 #include <sys/sysctl.h>
@@ -12,7 +13,7 @@ static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("缺符号 %s"
 
 // 游戏参数：argv[0] 固定为 "D2R"，"--" 之后的原样追加（真机由 nn::init 从进程参数区取，经 SetHostArgc/Argv 交给 SDK）
 // Game arguments: argv[0] is fixed to "D2R", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
-static char *g_argv[64] = {"D2R"}; static int g_argc = 1;
+static char *g_argv[64]; static int g_argc = 1;
 
 void crash_sample_self(void);
 // 存档落盘节流：游戏把脏了的存档容器写盘并提交的「非强制刷新」每拍调一次（main+0x2497ac → main+0xdff8a4，强制 = 0），
@@ -72,9 +73,9 @@ static void guest_main(void) {
     dm_prof_mark("③ 各模块 init_array");
     ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
     ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
-    game_seed_maybe(); save_throttle_patch();
+    if (dm_game_is_d2r()) { game_seed_maybe(); save_throttle_patch(); }
     { void dm_guest_spawn_selftest(void); dm_guest_spawn_selftest(); }   // DM_GUEST_SPAWN_TEST 宿主客体线程自检（hle_guestthread.c） | DM_GUEST_SPAWN_TEST self-test of host-created guest threads (hle_guestthread.c)
-    { void dm_padmode_boot(void); dm_padmode_boot(); }   // 触屏覆盖层在：布局前缀改指触屏版（dm_padmode.c），要在游戏建面板之前 | Touch overlay present: repoint the layout prefixes to the touch version (dm_padmode.c); must happen before the game builds its panels
+    if (dm_game_is_d2r()) { void dm_padmode_boot(void); dm_padmode_boot(); }   // 触屏覆盖层在：布局前缀改指触屏版（dm_padmode.c），要在游戏建面板之前 | Touch overlay present: repoint the layout prefixes to the touch version (dm_padmode.c); must happen before the game builds its panels
     LOG(">>> nnMain"); ((fn0)req("nnMain"))();
     LOG("nnMain returned");
 }
@@ -83,6 +84,7 @@ struct dm_flags g_flag;
 uint64_t g_t0_ns;
 static void flags_init(void) {
     g_flag.thr = !!getenv("DM_THR"); g_flag.svc = !!getenv("DM_SVC"); g_flag.fs = !!getenv("DM_FS");
+    g_flag.svc_trace = !!getenv("DM_SVC_TRACE");
     g_flag.movie = !!getenv("DM_MOVIE"); g_flag.dbg = !!getenv("DM_DBG"); g_flag.imports = !!getenv("DM_IMPORTS");
     g_flag.bootprof = !!getenv("DM_BOOTPROF");
 }
@@ -109,6 +111,7 @@ static void host_preload(int argc, char **argv) {
     flags_init();
     dm_prof_mark("⓪ 进程创建 → 宿主 main（dyld）");
     if (argc < 2) die("usage: dmhost <dir> [mod...] [-- 游戏参数...]");
+    g_argv[0] = (char *)dm_game_argv0();
     // 时区：游戏把绝对时刻换成本地时刻走两条路，都落到宿主 libc——nn::time::ToCalendarTime（hle_time.c，localtime_r）和客体 libc 的
     // localtime_r / mktime（hle_table.c 直连宿主）。所以宿主跟系统时区走，原版界面（编年史发现时刻等）才是本机时间。
     // 只有确定性对拍（DM_FIXED_TIME）钉成 UTC：同一份回放在本机（东八区）和 mini（东九区）上要换出同样的日历时刻
@@ -134,13 +137,19 @@ static void host_preload(int argc, char **argv) {
     if (!n) { names[n++] = "main"; names[n++] = "sdk"; }
     load_modules(argv[1], names, n);
     uint64_t ta = now_ns();
-    probe_install();   // DM_PROBE 探针（诊断用） | DM_PROBE probes (for diagnostics)
-    ticks_install();   // DM_TICKS 逐拍状态哈希（拍入口观测门） | DM_TICKS per-tick state hash (tick-entry observation gate)
-    { void target_rank_install(void); target_rank_install(); }   // 触屏版自动选怪 Boss > 精英 > 普通（hle_target.c） | Touch version auto-targeting Boss > elite > normal (hle_target.c)
-    hid_keys_init();   // DM_KEYS 脚本输入（按 UI 消息驱动的步骤要在消息出现前订阅） | DM_KEYS scripted input (steps driven by UI messages must subscribe before the message appears)
-    uint64_t tb = now_ns();
-    tact_chk_init();                // DM_TACTCHK 逐块记录（到选角停记） | DM_TACTCHK per-block log (logging stops at character select)
-    tact_prefetch_start(argv[1]);   // 启动块后台预解码（缺省开：产物目录 bootlist.tsv；DM_TACT_PREFETCH=0 关） | Background pre-decode of boot blocks (on by default: bootlist.tsv in the build output directory; DM_TACT_PREFETCH=0 turns it off)
+    uint64_t tb = ta;
+    if (dm_game_is_d2r()) {
+        probe_install();   // DM_PROBE 探针（诊断用） | DM_PROBE probes (for diagnostics)
+        ticks_install();   // DM_TICKS 逐拍状态哈希（拍入口观测门） | DM_TICKS per-tick state hash (tick-entry observation gate)
+        { void target_rank_install(void); target_rank_install(); }   // 触屏版自动选怪 Boss > 精英 > 普通（hle_target.c） | Touch version auto-targeting Boss > elite > normal (hle_target.c)
+        hid_keys_init();   // DM_KEYS 脚本输入（按 UI 消息驱动的步骤要在消息出现前订阅） | DM_KEYS scripted input (steps driven by UI messages must subscribe before the message appears)
+        tb = now_ns();
+        tact_chk_init();                // DM_TACTCHK 逐块记录（到选角停记） | DM_TACTCHK per-block log (logging stops at character select)
+        tact_prefetch_start(argv[1]);   // 启动块后台预解码（缺省开：产物目录 bootlist.tsv；DM_TACT_PREFETCH=0 关） | Background pre-decode of boot blocks (on by default: bootlist.tsv in the build output directory; DM_TACT_PREFETCH=0 turns it off)
+    } else {
+        probe_install();   // DM_PROBE 探针同样适用于非 D2R profile（只读 Mac 开发诊断） | DM_PROBE probes also apply to non-D2R profiles (read-only Mac development diagnostics)
+        LOG("ACNH profile：跳过 D2R 专用观测门、触屏业务泵和 TACT 预取");
+    }
     uint64_t tc = now_ns();
     stubs_report();
     if (g_flag.bootprof) LOG("① 细分（装载后）：探针 / 拍门 / 按键 %.1f ms、预取启动（读清单）%.1f ms、桩报告 %.1f ms", (tb - ta) / 1e6, (tc - tb) / 1e6, (now_ns() - tc) / 1e6);

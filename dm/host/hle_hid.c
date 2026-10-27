@@ -372,6 +372,17 @@ static void receipt(const NpadState *s, uint32_t id, uint32_t style, uint64_t km
 void (*dm_pad_hook)(uint64_t, uint64_t *, int32_t *, int32_t *, int32_t *, int32_t *);
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     pthread_once(&g_receipt_once, receipt_init);
+    if (dm_game_is_acnh() || dm_game_is_d3()) {
+        memset(s, 0, sizeof *s);
+        s->sampling = ++g_sampling;
+        if (style_of(id) & style) {
+            s->buttons = g_in.buttons | atomic_load(&g_pad_btn);
+            s->lx = g_in.lx; s->ly = g_in.ly; s->rx = g_in.rx; s->ry = g_in.ry;
+            s->attributes = ATTR_CONNECTED;
+        }
+        receipt(s, id, style, 0, 0);
+        return;
+    }
     DM_PROF(0, "taps", ui_taps_step());
     DM_PROF(0, "ui_frontend", dm_ui_frontend_pump());
     { void dm_textinput_pump(void); DM_PROF(0, "textinput", dm_textinput_pump()); }   // 文本框补「弹键盘」那一下、数量框设值（dm_textinput.c） | the extra "bring up keyboard" press for text boxes, setting the value of quantity boxes (dm_textinput.c)

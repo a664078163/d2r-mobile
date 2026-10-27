@@ -36,6 +36,7 @@ run: \
 	$(B)/t_warp_diag \
 	$(B)/t_romfs_validate \
 	$(B)/t_rwlv \
+	$(B)/t_service_event \
 	$(B)/t_swkbd \
 	$(B)/t_target_rank \
 	$(B)/t_textbox \
@@ -69,6 +70,7 @@ run: \
 	DM_ROMFS="$(DM_ROOT)/data/switch/3.3.94012/Update/RomFS" $(B)/t_romfs_validate
 	$(B)/t_audio
 	$(B)/t_audio_spsc
+	$(B)/t_service_event
 	$(B)/t_swkbd
 	$(B)/t_altstack
 	$(B)/t_movie
@@ -110,12 +112,15 @@ $(B)/t_cloudsync: t_cloudsync.c ../dm_cloudsync.c ../dm.h | $(B)
 	clang -O1 -Wall -Werror -I.. -o $@ t_cloudsync.c ../dm_cloudsync.c
 $(B)/t_touch: t_touch.c ../hle_touch.c ../front.h ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -I.. -o $@ t_touch.c ../hle_touch.c
-$(B)/t_fs: t_fs.c t_fs_stub.c ../hle_fs.c ../hle.h ../dm.h ../dm_i18n.c | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_fs.c t_fs_stub.c ../dm_i18n.c
+$(B)/t_fs: t_fs.c t_fs_stub.c ../hle_fs.c ../dm_game.c ../dm_game.h ../hle.h ../dm.h ../dm_i18n.c | $(B)
+	clang -O1 -Wno-unused-function -I.. -o $@ t_fs.c t_fs_stub.c ../dm_game.c ../dm_i18n.c
 $(B)/t_audio: t_audio.c ../hle_audio.c ../hle.h ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -I.. -o $@ t_audio.c -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 $(B)/t_audio_spsc: t_audio_spsc.c ../hle_audio.c ../hle.h ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -I.. -o $@ t_audio_spsc.c -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
+
+$(B)/t_service_event: t_service_event.c ../hle_thread.c t_condvar_stub.c | $(B)
+	clang -O1 -Wno-unused-function -I.. -o $@ t_service_event.c t_condvar_stub.c ../hle_thread.c
 $(B)/t_audio_spsc_tsan: t_audio_spsc.c ../hle_audio.c ../hle.h ../dm.h | $(B)
 	clang -O1 -g -O1 -fsanitize=thread -Wno-unused-function -I.. -o $@ t_audio_spsc.c -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 $(B)/t_swkbd: t_swkbd.c ../hle_swkbd.c ../hle.h ../dm.h | $(B)
@@ -136,8 +141,8 @@ $(B)/t_condvar: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h | $(B)
 $(B)/t_condvar_old: t_condvar.c t_condvar_stub.c ../hle_thread.c ../dm.h | $(B)
 	clang -O1 -Wno-unused-function -DDM_TEST_HOOKS -DDM_TEST_CV_OLD_ORDER -I.. -o $@ t_condvar.c t_condvar_stub.c ../hle_thread.c
 
-$(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../hle.h ../dm.h ../dm_i18n.c | $(B)
-	clang -O1 -Wno-unused-function -I.. -o $@ t_fs_case.c ../dm_i18n.c
+$(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../dm_game.c ../dm_game.h ../hle.h ../dm.h ../dm_i18n.c | $(B)
+	clang -O1 -Wno-unused-function -I.. -o $@ t_fs_case.c ../dm_game.c ../dm_i18n.c
 $(B)/t_romfs_validate: t_romfs_validate.c ../romfs_validate.c ../romfs_validate.h ../dm_i18n.c ../dm_i18n_tab.h | $(B)
 	clang -O1 -Wno-unused-function -I.. -o $@ t_romfs_validate.c ../romfs_validate.c ../dm_i18n.c
 

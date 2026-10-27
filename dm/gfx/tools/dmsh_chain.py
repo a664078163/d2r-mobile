@@ -21,9 +21,10 @@ import os, sys, hashlib, subprocess
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
 FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_fetch.py', 'tools/dmsh_facts.py', 'nvn/shader_facts.tsv', 'tools/dmsh_xlate/Program.cs', 'tools/dmsh_xlate/dmsh_xlate.csproj',
-         'nvn/shader_map.tsv', 'nvn/shader_map.tsv.conflicts.tsv', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
+         'nvn/shader_map.tsv', 'nvn/shader_map.tsv.conflicts.tsv', '../tools/acnh_shader.py', 'nvn/shader_map_acnh.tsv',
+         '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
 LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain.h')
-XLATE_DIR = os.path.dirname(os.environ.get('XLATE', f'{DM_ROOT}/build/gfx/dmsh_xlate/dmsh_xlate'))
+XLATE_DIR = os.path.dirname(os.environ.get('DMSH_XLATE') or os.environ.get('XLATE') or f'{DM_ROOT}/build/gfx/dmsh_xlate/dmsh_xlate')
 
 def options():
     return 'debug=%s reduced=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1')

@@ -26,11 +26,23 @@ void dm_host_shutdown(const char *why);   // 宿主优雅退出（dm/host/hle_li
 #include "front.h"                        // front_game_res（全屏输出分辨率） | front_game_res (full-screen output resolution)
 #include "../../host/romfs_validate.h"
 #include "../../host/dm_i18n.h"
+#include "dm_pack.h"
 static NSString *T(const char *k) { return @(dm_ui(k)); }   // 我们自己的界面文字（中英表 dm/i18n/ui_text.tsv，语言跟原版设置走） | our own UI text (Chinese-English string table dm/i18n/ui_text.tsv, language follows the original game's setting)
 #import <Network/Network.h>
 #include "dm_metal_cache_guard.h"
 
 static NSString *g_mode;
+#if defined(DM_IOS_GAME_ACNH) && DM_IOS_GAME_ACNH
+static const int g_acnh = 1;
+#else
+static const int g_acnh = 0;
+#endif
+#if defined(DM_IOS_GAME_D3) && DM_IOS_GAME_D3
+static const int g_d3 = 1;
+#else
+static const int g_d3 = 0;
+#endif
+static int g_native_game(void) { return g_acnh || g_d3; }
 static int g_log = -1;
 static int g_log_tee;
 static int g_log_stderr = -1;
@@ -296,6 +308,90 @@ void front_ios_lifecycle_install(void); // front_ios.m
 void front_ios_focus_event(int ev);     // front_ios.m
 static char *g_boot_argv[8];
 static int g_boot_argc = 4;
+
+static BOOL acnh_find_romfs(NSString **base, NSString **update, char *why, size_t n) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)[0];
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+    NSString *anchor = @"Shader/Park_UBER_All.Nin_NX_NVN.szs";
+    // Development pushes use Application Support; Finder/Files imports use
+    // Documents because the mounted device container does not let the host
+    // create directories under Library directly.  Keep the former as the
+    // primary path and accept the latter as a stable device-side fallback.
+    NSArray<NSString *> *roots = @[[support stringByAppendingPathComponent:@"acnh"],
+                                   [doc stringByAppendingPathComponent:@"acnh"]];
+    NSString *b = nil, *u = nil;
+    for (NSString *candidate in roots) {
+        NSString *cb = [candidate stringByAppendingPathComponent:@"romfs"];
+        NSString *cu = [candidate stringByAppendingPathComponent:@"update"];
+        char completeWhy[128];
+        BOOL cbComplete = dm_pack_is_complete(cb.fileSystemRepresentation,
+                                                completeWhy, sizeof completeWhy);
+        BOOL cuComplete = dm_pack_is_complete(cu.fileSystemRepresentation,
+                                                completeWhy, sizeof completeWhy);
+        if (!b && cbComplete &&
+            [fm fileExistsAtPath:[cb stringByAppendingPathComponent:anchor]]) b = cb;
+        if (!u && cuComplete &&
+            [fm fileExistsAtPath:[cu stringByAppendingPathComponent:anchor]]) u = cu;
+    }
+    if (!b || !u) {
+        snprintf(why, n, "ACNH 资源不完整：缺少%s RomFS。本体和升级必须同时导入；"
+                 "请把本体放到 Application Support/acnh/romfs 或 Documents/acnh/romfs，"
+                 "升级放到对应的 update 目录", !b && !u ? "本体和升级" : !b ? "本体" : "升级");
+        return NO;
+    }
+    if (base) *base = b;
+    if (update) *update = u;
+    snprintf(why, n, "ACNH RomFS：本体 + 升级");
+    return YES;
+}
+
+static NSString *acnh_romfs_locate(char *why, size_t n) {
+    NSString *base = nil, *update = nil;
+    if (!acnh_find_romfs(&base, &update, why, n)) return nil;
+    if (base && update) {
+        setenv("DM_ROMFS_OVERLAY", [[NSString stringWithFormat:@"%@:%@", update, base] fileSystemRepresentation], 1);
+    } else {
+        unsetenv("DM_ROMFS_OVERLAY");
+    }
+    return base ?: update;
+}
+
+static BOOL d3_dir_has_files(NSString *root) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL is_dir = NO;
+    if (![fm fileExistsAtPath:root isDirectory:&is_dir] || !is_dir) return NO;
+    NSDirectoryEnumerator *e = [fm enumeratorAtPath:root];
+    return e != nil && [e nextObject] != nil;
+}
+static BOOL d3_find_romfs(NSString **base, NSString **update, char *why, size_t n) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)[0];
+    NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+    NSArray<NSString *> *roots = @[[support stringByAppendingPathComponent:@"d3"], [doc stringByAppendingPathComponent:@"d3"]];
+    NSString *b = nil, *u = nil; BOOL hb = NO, hu = NO;
+    for (NSString *candidate in roots) {
+        NSString *cb = [candidate stringByAppendingPathComponent:@"romfs"];
+        NSString *cu = [candidate stringByAppendingPathComponent:@"update"];
+        hb = d3_dir_has_files(cb); hu = d3_dir_has_files(cu);
+        if (hb || hu) { b = cb; u = cu; break; }
+    }
+    if (!hb && !hu) {
+        snprintf(why, n, "找不到 Diablo III RomFS。请把本体放到 Application Support/d3/romfs 或 Documents/d3/romfs，升级放到对应的 update 目录（至少准备其中一份）");
+        return NO;
+    }
+    if (base) *base = hb ? b : nil;
+    if (update) *update = hu ? u : nil;
+    snprintf(why, n, "Diablo III RomFS：%s%s%s", hb ? "本体" : "", hb && hu ? " + " : "", hu ? "升级" : "");
+    return YES;
+}
+static NSString *d3_romfs_locate(char *why, size_t n) {
+    NSString *base = nil, *update = nil;
+    if (!d3_find_romfs(&base, &update, why, n)) return nil;
+    if (base && update) setenv("DM_ROMFS_OVERLAY", [[NSString stringWithFormat:@"%@:%@", update, base] fileSystemRepresentation], 1);
+    else unsetenv("DM_ROMFS_OVERLAY");
+    return base ?: update;
+}
 // RomFS 在哪：开发机由 devicectl 推进 Application Support/romfs；TestFlight / 商店安装在苹果托管资源包 romfs 里（只读）。都没有返回 nil（why 写原因）
 // ---- 老机型补充包：显卡不支持 BC 的机型（A16 及以前）要用的 ASTC 贴图，玩家用「文件」拷进「D2R Mobile」或 App 里下载 ----
 // 包内 romfs_overlay_astc/pack.json = 本包配套的补充包（档名、字节数、SHA-256，出包时由 dm/tools/astc_pack.py finalize 生成）；没有这个文件 = 本包不带老机型支持。
@@ -500,7 +596,7 @@ static int g_need_assets;   // 启动时资源包还没到：先不起宿主，�
 // Do not start the host; show an alert explaining, then exit. The test switch DM_TEST_NO_BC=1 treats the device as unsupported
 static int g_no_bc;
 static char g_astc_why[512];   // 没用上补充包的原因（弹框里给玩家看） | Why the Legacy Device Pack was not used (shown to the player in the alert)
-static void astc_handoff(UIWindow *w);   // 补充包到位：换成资源界面（AssetVC，资源齐了就地进游戏），定义在 AssetVC 之后 | Legacy Device Pack in place: switch to the asset screen (AssetVC; enters the game in place once assets are complete); defined after AssetVC
+static void assets_handoff(UIWindow *w);   // 按游戏 profile 换成资源界面；定义在资源控制器之后 | Switch to the profile-specific asset screen; defined after the asset controllers
 static BOOL res_dl_configured(void) {   // 游戏资源的自动下载地址配了没有：测试环境变量，或包内 dm/asset_base.txt / dm/asset_pointers.txt 有非注释行 | Whether an automatic download address for the game resources is configured: the test environment variable, or a non-comment line in the bundled dm/asset_base.txt / dm/asset_pointers.txt
     if (getenv("DM_TEST_NO_DL_BASE")) return NO;   // 只测试用：当成没配下载地址的包（照公开仓库自己出的包就是这样） | Test only: treat this as a build with no download address configured (which is what a build made by yourself from the public repository is)
     const char *e = getenv("DM_ASSET_BASE"); if (e && *e) return YES;
@@ -588,7 +684,7 @@ static NSString *pack_check(void) {
 }
 - (void)recheck {
     g_astc_why[0] = 0; NSString *d = astc_pack_locate(g_astc_why, sizeof g_astc_why);
-    if (d) { g_astc_dir = d; plog("boot: 补充包到位 %s，接着检查游戏资源", d.UTF8String); astc_handoff(self.view.window); return; }
+    if (d) { g_astc_dir = d; plog("boot: 补充包到位 %s，接着检查游戏资源", d.UTF8String); assets_handoff(self.view.window); return; }
     plog("boot: 补充包仍不可用：%s", g_astc_why); [self ask];
 }
 - (void)download {
@@ -613,6 +709,55 @@ static void boot_prepare(void) {
     NSString *support = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)[0];
     NSString *romfs = [support stringByAppendingPathComponent:@"romfs"];
     NSFileManager *fm = NSFileManager.defaultManager;
+    if (g_native_game()) {
+        // Create the ACNH import directories before checking for resources.  A
+        // freshly installed app has no Application Support/acnh yet; the
+        // device container UI can copy into an existing directory, but its
+        // mounted filesystem does not allow the host to mkdir one directly.
+        // Creating these paths on the first launch preserves the established
+        // D2R-style import layout and does not touch the D2R container.
+        NSString *game_root = [support stringByAppendingPathComponent:(g_acnh ? @"acnh" : @"d3")];
+        [fm createDirectoryAtPath:[game_root stringByAppendingPathComponent:@"romfs"]
+             withIntermediateDirectories:YES attributes:nil error:nil];
+        [fm createDirectoryAtPath:[game_root stringByAppendingPathComponent:@"update"]
+             withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *base = nil, *update = nil;
+        BOOL found = g_acnh ? acnh_find_romfs(&base, &update, g_romfs_why, sizeof g_romfs_why) : d3_find_romfs(&base, &update, g_romfs_why, sizeof g_romfs_why);
+        if (!found) {
+            plog("boot: 🔴 %s", g_romfs_why);
+            // Keep UIApplicationMain alive so the profile-specific repair page
+            // can be shown and a later retry can configure the host after the
+            // user imports the missing layers.
+            g_need_assets = 1;
+            return;
+        }
+        NSString *active = base ?: update;
+        [fm createDirectoryAtPath:[doc stringByAppendingPathComponent:@"save"]
+             withIntermediateDirectories:YES attributes:nil error:nil];
+        [fm createDirectoryAtPath:[doc stringByAppendingPathComponent:@"temp"]
+             withIntermediateDirectories:YES attributes:nil error:nil];
+        setenv("DM_ROMFS", active.fileSystemRepresentation, 1);
+        if (base && update) {
+            NSString *chain = [NSString stringWithFormat:@"%@:%@", update, base];
+            setenv("DM_ROMFS_OVERLAY", chain.fileSystemRepresentation, 1);
+            plog("boot: %s RomFS 分层：base=%s update=%s", g_acnh ? "ACNH" : "Diablo III", base.fileSystemRepresentation, update.fileSystemRepresentation);
+        } else {
+            unsetenv("DM_ROMFS_OVERLAY");
+            plog("boot: %s RomFS 单层：%s", g_acnh ? "ACNH" : "Diablo III", active.fileSystemRepresentation);
+        }
+        setenv("DM_SAVE", [doc stringByAppendingPathComponent:@"save"].fileSystemRepresentation, 1);
+        setenv("DM_TEMP", [doc stringByAppendingPathComponent:@"temp"].fileSystemRepresentation, 1);
+        setenv("DM_NVN_SHMAP", [res stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation, 1);
+        setenv("DM_MSL_DIR", [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"msl"].fileSystemRepresentation, 1);
+        if (chdir(doc.fileSystemRepresentation)) plog("boot: 🔴 chdir Documents 失败 %s", strerror(errno));
+        g_boot_argv[0] = "dmhost";
+        g_boot_argv[1] = strdup(res.fileSystemRepresentation);
+        g_boot_argv[2] = "main";
+        g_boot_argv[3] = "sdk";
+        if (g_acnh) { g_boot_argv[4] = "subsdk0"; g_boot_argc = 5; }
+        else g_boot_argc = 4;
+        return;
+    }
     [fm createDirectoryAtPath:romfs withIntermediateDirectories:YES attributes:nil error:nil];
     NSURL *romURL = [NSURL fileURLWithPath:romfs]; NSNumber *excluded = @YES; [romURL setResourceValue:excluded forKey:NSURLIsExcludedFromBackupKey error:nil];
     const char *romwhy = g_romfs_why;
@@ -691,9 +836,12 @@ static void boot_begin(void) {
     plog("启动计时 boot_prepare %.1f → %.1f ms（开日志 %.1f ms 起）", tp0, since_start(), g_T[2]);
     // 宿主装载（读 NSO / 重定位 / 强制接管 / 预取起跑）提前在后台跑，与 UIKit 启动链并行；dm_main 进来时等它完成。DM_NO_PRELOAD=1 关（对照用）
     // Host loading (read NSO / relocate / forced takeover / prefetch kickoff) runs early in the background, in parallel with the UIKit launch chain; dm_main waits for it to finish on entry. DM_NO_PRELOAD=1 turns it off (for comparison)
-    { void dm_sharelog_boot(void); dm_sharelog_boot(); }   // 暂停菜单「分享诊断日志」的回调登记给宿主（dm_sharelog.m） | Register the callback for the pause menu's 「分享诊断日志」(Share Diagnostics) with the host (dm_sharelog.m)
-    { void dm_update_boot(void); dm_update_boot(); }   // 构建号交给宿主（选角页左下角）、登记新版本提示的两个回调（dm_update.m） | Hand the build number to the host (bottom-left of the character select page) and register the two callbacks for the new-version notice (dm_update.m)
-    if (!getenv("DM_NO_PRELOAD")) dm_host_preload_start(g_boot_argc, g_boot_argv);
+    if (!g_native_game()) {
+        { void dm_sharelog_boot(void); dm_sharelog_boot(); }
+        { void dm_update_boot(void); dm_update_boot(); }
+    }
+    if (!g_need_assets && !getenv("DM_NO_PRELOAD")) dm_host_preload_start(g_boot_argc, g_boot_argv);
+    else if (g_need_assets) plog("boot: profile 资源未就绪，跳过宿主预加载，等待资源页重试");
     else plog("boot: DM_NO_PRELOAD——宿主装载不提前（对照）");
 }
 static void *boot_thread(void *arg) {
@@ -704,7 +852,7 @@ static void *boot_thread(void *arg) {
       plog("boot: 前端给游戏的输出分辨率 主机 %llux%llu / 掌机 %llux%llu", r & 0xffffffff, r >> 32, r0 & 0xffffffff, r0 >> 32); }
     g_T[6] = since_start();
     plog("启动计时 T5 boot_thread 入口 %.1f ms · T6 dm_main 前 %.1f ms", g_T[5], g_T[6]);
-    { void dm_cloud_boot(void); dm_cloud_boot(); }   // iCloud 同步：挂存档之前把云端更新的角色 / 共享仓库换进来（最多等 5 秒；cloud_ios.m） | iCloud sync: before mounting saves, swap in the characters / shared stash that are newer in the cloud (wait at most 5 seconds; cloud_ios.m)
+    if (!g_native_game()) { void dm_cloud_boot(void); dm_cloud_boot(); }
     plog("boot: dm_main %s", argv[1]);
     int rc = dm_main(g_boot_argc, argv);
     plog("boot: dm_main 返回 %d", rc);
@@ -739,13 +887,13 @@ static void log_promote(void) {   // 场景第一次到前台：这一轮是玩�
 static void host_start(void) {
     if (g_host_up) return;
     if (getenv("DM_TEST_BG_RELAUNCH")) return;   // 这次启动只为造后台拉起（见 bg_relaunch_test），马上自己退出 | this launch exists only to stage a background relaunch (see bg_relaunch_test) and exits by itself right away
-    { NSString *r = romfs_locate(g_romfs_why, sizeof g_romfs_why);   // 资源校验：起宿主前只在这里做一次（boot_prepare 用这次结果）。没过（启动判定之后资源被挪 / 删）就回资源界面，不闪退 | Resource check: done only once, here, before starting the host (boot_prepare uses this result). If it fails (resources moved / deleted after the launch decision), go back to the resources screen instead of crashing
-      if (!r) { plog("boot: 起宿主前资源校验没过（%s），回到资源界面", g_romfs_why); if (g_window) astc_handoff(g_window); return; }
+    { NSString *r = g_acnh ? acnh_romfs_locate(g_romfs_why, sizeof g_romfs_why) : g_d3 ? d3_romfs_locate(g_romfs_why, sizeof g_romfs_why) : romfs_locate(g_romfs_why, sizeof g_romfs_why);   // 资源校验：起宿主前只在这里做一次（boot_prepare 用这次结果）。没过（启动判定之后资源被挪 / 删）就回资源界面，不闪退 | Resource check: done only once, here, before starting the host (boot_prepare uses this result). If it fails (resources moved / deleted after the launch decision), go back to the resources screen instead of crashing
+      if (!r) { plog("boot: 起宿主前资源校验没过（%s），回到资源界面", g_romfs_why); if (g_window) assets_handoff(g_window); return; }
       g_romfs = r; }
 #ifdef DM_SHELL
     // 壳：着色器是以源码进包的话，进游戏之前先一次编完（dm_shader_prep.m，带进度页）；做完它回头再调这里
     // Shell: if the shaders are shipped as source in the package, compile them all in one go before entering the game (dm_shader_prep.m, with a progress page); when done it calls back here
-    { extern int dm_shader_prep_begin(void (^)(void)); static int asked; if (!asked) { asked = 1; if (dm_shader_prep_begin(^{ host_start(); })) return; } }
+    if (!g_native_game()) { extern int dm_shader_prep_begin(void (^)(void)); static int asked; if (!asked) { asked = 1; if (dm_shader_prep_begin(^{ host_start(); })) return; } }
 #endif
     g_host_up = 1; plog("boot: 场景到前台，起宿主（进程已活 %.1f ms）", since_start());
     { const char *mw = getenv("DM_TEST_MEMWARN");   // 测试开关 DM_TEST_MEMWARN=<秒>：起宿主后这么多秒，照系统的调法调一次内存告警回调（验那一行日志；系统真发告警的时机造不出来） | test switch DM_TEST_MEMWARN=<seconds>: this many seconds after the host starts, call the memory-warning callback once the way the system does (to check that log line; the moment the system really sends a warning cannot be staged)
@@ -1038,9 +1186,6 @@ static int64_t free_bytes(void) {   // 给 App 用的可用空间（系统「重
     front_ios_focus_event(3);
 }
 @end
-static void astc_handoff(UIWindow *w) {   // 补充包到位（玩家刚拷好 / 刚下完）：交给资源界面——资源齐了就地进游戏，不齐就照常提示 / 下载 | Legacy Device Pack in place (the player just finished copying / downloading it): hand over to the asset screen -- if assets are complete, enter the game in place; if not, prompt / download as usual
-    g_no_bc = 0; g_need_assets = 1; AssetVC *vc = [AssetVC new]; w.rootViewController = vc;
-}
 // 场景生命周期（Info.plist UIApplicationSceneManifest → SceneDelegate）：建窗口 + 焦点事件交 front_ios.m
 // 游戏画面的根控制器：画面铺满全屏（含灵动岛两侧与圆角），所以要向系统声明两件事——
 // ① 四边的系统边缘手势延后一拍（底边上滑回桌面、顶边下拉通知）：摇杆 / 技能钮 / 底栏都贴着边，不延后的话一拖就退出游戏；延后 = 第一下只露出横条、第二下才生效
@@ -1060,6 +1205,384 @@ static void astc_handoff(UIWindow *w) {   // 补充包到位（玩家刚拷好 /
     plog("安全区 上 %.1f 左 %.1f 下 %.1f 右 %.1f（点）；视图 %.0fx%.0f；朝向 %ld", i.top, i.left, i.bottom, i.right, z.width, z.height, (long)self.view.window.windowScene.interfaceOrientation);
 }
 @end
+@interface AcnhAssetsVC : UIViewController
+@property (strong) UILabel *label;
+@property (strong) UIButton *retry;
+@property (strong) UIButton *import;
+@property (strong) UIProgressView *progress;
+@property (strong) UILabel *importState;
+@property (strong) NSArray<NSString *> *packPaths;
+@property (assign) BOOL importing;
+@property (strong) NSMutableDictionary<NSString *, NSNumber *> *cancelImportState;
+@property (strong) NSString *importLayer;
+@property (strong) NSString *pendingLayer;
+@end
+typedef struct {
+    __unsafe_unretained AcnhAssetsVC *controller;
+    NSMutableDictionary<NSString *, NSNumber *> *cancelState;
+    NSString *layer;
+    uint64_t last_ui_update;
+} AcnhPackImportContext;
+static int acnh_pack_progress(uint64_t done, uint64_t total, uint64_t entries,
+                              uint64_t all_entries, const char *current,
+                              void *user) {
+    AcnhPackImportContext *ctx = user;
+    if (ctx->cancelState[@"cancel"].boolValue) return 1;
+    static mach_timebase_info_data_t timebase;
+    if (!timebase.denom) mach_timebase_info(&timebase);
+    uint64_t now = mach_absolute_time() * timebase.numer / timebase.denom;
+    if (now - ctx->last_ui_update < NSEC_PER_SEC / 4 &&
+        entries != all_entries) {
+        return 0;
+    }
+    ctx->last_ui_update = now;
+    AcnhAssetsVC *vc = ctx->controller;
+    NSString *layer = ctx->layer;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        vc.progress.progress = total ? (float)((double)done / (double)total) : 0;
+        vc.importState.text = [NSString stringWithFormat:@"正在导入 %@：%llu / %llu 个文件\n%@", layer,
+            (unsigned long long)entries, (unsigned long long)all_entries,
+            current && *current ? @(current).lastPathComponent : @"校验完成"];
+    });
+    return 0;
+}
+static int acnh_pack_cancelled(void *user) {
+    AcnhPackImportContext *ctx = user;
+    return ctx->cancelState[@"cancel"].boolValue;
+}
+@implementation AcnhAssetsVC
+- (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
+- (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+- (BOOL)prefersStatusBarHidden { return YES; }
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.blackColor;
+    CGRect b = self.view.bounds;
+    self.label = [[UILabel alloc] initWithFrame:CGRectInset(b, 48, 80)];
+    self.label.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.label.textColor = [UIColor colorWithWhite:0.9 alpha:1];
+    self.label.textAlignment = NSTextAlignmentCenter;
+    self.label.numberOfLines = 0;
+    self.label.font = [UIFont systemFontOfSize:19 weight:UIFontWeightMedium];
+    if (g_acnh) self.label.text = @"找不到完整的动物森友会资源。\n\n请同时导入本体和升级资源包，然后点“重试”。\n\n本体：Application Support/acnh/romfs\n升级：Application Support/acnh/update";
+    else self.label.text = @"找不到 Diablo III RomFS。\n\n本体 RomFS 放到：\nApplication Support/d3/romfs\n\n升级 RomFS 放到：\nApplication Support/d3/update\n\n至少准备其中一份，然后点“重试”。";
+    self.retry = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.retry setTitle:@"重试" forState:UIControlStateNormal];
+    self.retry.titleLabel.font = [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold];
+    self.retry.frame = CGRectMake(b.size.width / 2 + 10, b.size.height - 92, 130, 44);
+    self.retry.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin;
+    [self.retry addTarget:self action:@selector(retryTap) forControlEvents:UIControlEventTouchUpInside];
+    self.import = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.import setTitle:@"导入资源包" forState:UIControlStateNormal];
+    self.import.titleLabel.font = [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold];
+    self.import.frame = CGRectMake(b.size.width / 2 - 140, b.size.height - 92, 140, 44);
+    self.import.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleTopMargin;
+    [self.import addTarget:self action:@selector(importTap) forControlEvents:UIControlEventTouchUpInside];
+    self.progress = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.progress.frame = CGRectMake(80, b.size.height - 132, b.size.width - 160, 4);
+    self.progress.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    self.progress.hidden = YES;
+    self.importState = [[UILabel alloc] initWithFrame:CGRectMake(48, b.size.height - 180, b.size.width - 96, 42)];
+    self.importState.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    self.importState.textColor = [UIColor colorWithWhite:0.8 alpha:1];
+    self.importState.textAlignment = NSTextAlignmentCenter;
+    self.importState.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    self.importState.numberOfLines = 2;
+    self.importState.text = @"把完整的一层 .dmp 包放进 Library/Caches/acnh-packs 后，点“导入资源包”。\n全部校验通过后才替换现有资源。";
+    [self.view addSubview:self.label];
+    [self.view addSubview:self.retry];
+    [self.view addSubview:self.import];
+    [self.view addSubview:self.progress];
+    [self.view addSubview:self.importState];
+    UIApplication.sharedApplication.idleTimerDisabled = YES;
+    plog("assets: %s 显示 RomFS 修复页", g_acnh ? "ACNH" : "Diablo III");
+}
+- (NSString *)documentsPath {
+    return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+}
+- (NSArray<NSString *> *)packsRoots {
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES)[0];
+    return @[[caches stringByAppendingPathComponent:@"acnh-packs"], [self documentsPath]];
+}
+- (void)findPacksIn:(NSString *)directory depth:(NSInteger)depth base:(NSMutableArray<NSString *> *)base update:(NSMutableArray<NSString *> *)update {
+    if (depth < 0) return;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *name in [[fm contentsOfDirectoryAtPath:directory error:nil] sortedArrayUsingSelector:@selector(compare:)]) {
+        NSString *path = [directory stringByAppendingPathComponent:name];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+        if ([attrs[NSFileType] isEqualToString:NSFileTypeDirectory]) {
+            [self findPacksIn:path depth:depth - 1 base:base update:update];
+            continue;
+        }
+        if (![name.pathExtension.lowercaseString isEqualToString:@"dmp"]) continue;
+        NSString *lower = path.lowercaseString;
+        NSString *stem = name.stringByDeletingPathExtension.lowercaseString;
+        if ([stem hasPrefix:@"base-"] || [stem hasPrefix:@"romfs-"] ||
+            [lower containsString:@"/base"] || [lower containsString:@"romfs"]) [base addObject:path];
+        else if ([stem hasPrefix:@"update-"] || [stem hasPrefix:@"upgrade-"] ||
+                 [lower containsString:@"/update"] || [lower containsString:@"upgrade"]) [update addObject:path];
+    }
+}
+- (NSArray<NSString *> *)uniquePacks:(NSArray<NSString *> *)input {
+    NSMutableOrderedSet<NSString *> *seen = [NSMutableOrderedSet orderedSet];
+    for (NSString *path in input) [seen addObject:path.stringByStandardizingPath];
+    return seen.array;
+}
+- (NSArray<NSString *> *)packsForLayer:(NSString *)layer from:(NSArray<NSString *> *)input {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *path in input) {
+        NSString *key = path.lowercaseString;
+        BOOL isBase = [path.lastPathComponent.lowercaseString hasPrefix:@"base"] ||
+                      [key containsString:@"/base"] || [key containsString:@"romfs"];
+        BOOL wantBase = [layer isEqualToString:@"romfs"];
+        if (isBase == wantBase) [out addObject:path];
+    }
+    return [self uniquePacks:out];
+}
+- (NSArray<NSString *> *)completePacksForLayer:(NSString *)layer
+                                    candidates:(NSArray<NSString *> *)candidates
+                                          root:(NSString *)root {
+    /*
+     * A generated layer is a set of packs.  The cache can contain only the
+     * prefix that has already been copied to the phone, while Documents can
+     * contain the complete set.  Do not let the cache win merely because it
+     * has more recent-looking paths: inspect the pair metadata first.
+     *
+     * pair_count == 0 is the legacy standalone format.  It is accepted only
+     * when this layer has no paired candidates.  Once paired packs are
+     * present, a complete contiguous set is required; mixing generations or
+     * accepting a prefix would make dm_pack_extract reject the import later.
+     */
+    NSMutableArray<NSString *> *standalone = [NSMutableArray array];
+    NSMutableDictionary<NSNumber *, NSMutableArray<NSDictionary *> *> *paired = [NSMutableDictionary dictionary];
+    for (NSString *path in candidates) {
+        dm_pack_info info = {0};
+        char why[256] = {0};
+        int result = dm_pack_inspect(path.fileSystemRepresentation, &info, why, sizeof why);
+        if (result != DM_PACK_OK) {
+            plog("assets-import: 忽略无效 %@ 包 %s（%s）", layer.UTF8String,
+                 path.fileSystemRepresentation, why[0] ? why : "格式校验失败");
+            continue;
+        }
+        if (!info.pair_count) {
+            [standalone addObject:path];
+            continue;
+        }
+        NSNumber *count = @(info.pair_count);
+        NSMutableArray<NSDictionary *> *group = paired[count];
+        if (!group) {
+            group = [NSMutableArray array];
+            paired[count] = group;
+        }
+        [group addObject:@{ @"index": @(info.pair_index), @"path": path }];
+    }
+
+    for (NSNumber *countNumber in paired) {
+        NSUInteger count = countNumber.unsignedIntegerValue;
+        NSMutableDictionary<NSNumber *, NSString *> *byIndex = [NSMutableDictionary dictionary];
+        BOOL duplicate = NO;
+        NSArray<NSDictionary *> *group = paired[countNumber];
+        for (NSDictionary *item in group) {
+            NSNumber *index = item[@"index"];
+            if (byIndex[index]) { duplicate = YES; break; }
+            byIndex[index] = item[@"path"];
+        }
+        if (duplicate || byIndex.count != count) continue;
+        NSMutableArray<NSString *> *complete = [NSMutableArray arrayWithCapacity:count];
+        BOOL contiguous = YES;
+        for (NSUInteger i = 1; i <= count; i++) {
+            NSString *path = byIndex[@(i)];
+            if (!path) { contiguous = NO; break; }
+            [complete addObject:path];
+        }
+        if (contiguous) {
+            plog("assets-import: %@ root=%s 选用完整批次 %lu/%lu", layer.UTF8String,
+                 root.fileSystemRepresentation, (unsigned long)count,
+                 (unsigned long)count);
+            return complete;
+        }
+    }
+
+    if (paired.count == 0 && standalone.count) {
+        plog("assets-import: %@ root=%s 选用 %lu 个独立包", layer.UTF8String,
+             root.fileSystemRepresentation, (unsigned long)standalone.count);
+        return [self uniquePacks:standalone];
+    }
+    if (candidates.count) {
+        plog("assets-import: %@ root=%s 没有完整批次（候选 %lu）", layer.UTF8String,
+             root.fileSystemRepresentation, (unsigned long)candidates.count);
+    }
+    return nil;
+}
+- (BOOL)isLayerComplete:(NSString *)layer {
+    NSString *support = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)[0] stringByAppendingPathComponent:@"acnh"];
+    NSString *destination = [support stringByAppendingPathComponent:layer];
+    char why[512];
+    return dm_pack_is_complete(destination.fileSystemRepresentation, why, sizeof why);
+}
+- (void)scanPacksWithBase:(NSMutableArray<NSString *> *)base update:(NSMutableArray<NSString *> *)update {
+    NSArray<NSString *> *baseSelection = nil;
+    NSArray<NSString *> *updateSelection = nil;
+    for (NSString *root in [self packsRoots]) {
+        NSMutableArray<NSString *> *rootBase = [NSMutableArray array];
+        NSMutableArray<NSString *> *rootUpdate = [NSMutableArray array];
+        [self findPacksIn:root depth:3 base:rootBase update:rootUpdate];
+        rootBase = [[self uniquePacks:rootBase] mutableCopy];
+        rootUpdate = [[self uniquePacks:rootUpdate] mutableCopy];
+        // Select each layer from the first root with a complete pair set.
+        // An incomplete Caches prefix must not shadow a complete Documents set.
+        if (!baseSelection) baseSelection = [self completePacksForLayer:@"romfs"
+                                                               candidates:rootBase
+                                                                     root:root];
+        if (!updateSelection) updateSelection = [self completePacksForLayer:@"update"
+                                                                   candidates:rootUpdate
+                                                                         root:root];
+        if (baseSelection && updateSelection) break;
+    }
+    if (baseSelection) [base addObjectsFromArray:baseSelection];
+    if (updateSelection) [update addObjectsFromArray:updateSelection];
+}
+- (void)importTap {
+    plog("assets-import: 导入按钮按下");
+    if (self.importing) {
+        self.cancelImportState[@"cancel"] = @YES;
+        [self.import setTitle:@"正在取消…" forState:UIControlStateNormal];
+        plog("assets-import: 请求取消");
+        return;
+    }
+    NSMutableArray<NSString *> *base = [NSMutableArray array], *update = [NSMutableArray array];
+    [self scanPacksWithBase:base update:update];
+    plog("assets-import: 找到 update=%lu base=%lu（Caches/acnh-packs 优先）", (unsigned long)update.count, (unsigned long)base.count);
+    BOOL updateComplete = [self isLayerComplete:@"update"];
+    BOOL baseComplete = [self isLayerComplete:@"romfs"];
+    if (updateComplete) update = [NSMutableArray array];
+    if (baseComplete) base = [NSMutableArray array];
+    if (updateComplete || baseComplete) {
+        plog("assets-import: 已发布层 update=%d base=%d，跳过对应缓存包",
+             updateComplete, baseComplete);
+    }
+    if (!update.count && !base.count) {
+        if (updateComplete && baseComplete) {
+            self.importState.text = @"Update 和 Base 资源均已导入并校验。\n点“重试”启动。";
+            return;
+        }
+        plog("assets-import: Caches/acnh-packs 和 Documents 都没有 .dmp");
+        self.importState.text = updateComplete
+            ? @"Update 已导入并校验。\n未找到 Base 资源包；请把 base 包放入 Library/Caches/acnh-packs 后再导入。"
+            : baseComplete
+              ? @"Base 已导入并校验。\n未找到 Update 资源包；请把 update 包放入 Library/Caches/acnh-packs 后再导入。"
+              : @"没有找到 .dmp 资源包。\n请先把 update 或 base 资源包放入 App 的 Library/Caches/acnh-packs 或 Documents。";
+        return;
+    }
+    self.importLayer = update.count ? @"update" : @"romfs";
+    self.packPaths = update.count ? update : base;
+    self.pendingLayer = update.count && base.count ? @"romfs" : nil;
+    [self beginImportLayer:self.importLayer packs:self.packPaths];
+}
+- (void)finishImportLayer:(NSString *)layer result:(int)result reason:(NSString *)reason {
+    self.importing = NO;
+    self.progress.hidden = YES;
+    [self.import setTitle:@"导入资源包" forState:UIControlStateNormal];
+    plog("assets-import: 完成 layer=%s result=%d reason=%s",
+         layer.UTF8String, result, reason.UTF8String);
+    if (result != DM_PACK_OK) {
+        self.importState.text = [NSString stringWithFormat:@"%@ 导入未完成：%@", layer, reason];
+        plog("assets: %@ 资源包导入失败：%s", layer, reason.UTF8String);
+        return;
+    }
+    if ([layer isEqualToString:@"update"] && self.pendingLayer) {
+        NSMutableArray<NSString *> *base = [NSMutableArray array], *update = [NSMutableArray array];
+        [self scanPacksWithBase:base update:update];
+        NSArray<NSString *> *nextPacks = [self packsForLayer:self.pendingLayer from:base];
+        if (nextPacks.count) {
+            NSString *next = self.pendingLayer;
+            self.pendingLayer = nil;
+            self.importLayer = next;
+            self.packPaths = nextPacks;
+            self.importing = YES;
+            self.progress.hidden = NO;
+            self.progress.progress = 0;
+            [self.import setTitle:@"取消导入" forState:UIControlStateNormal];
+            [self beginImportLayer:next packs:nextPacks];
+            return;
+        }
+    }
+    self.importState.text = [NSString stringWithFormat:@"%@ 资源包导入完成。\n可以删除已用完的 .dmp，再点“重试”启动。", layer];
+    plog("assets: %@ 资源包导入完成", layer);
+}
+- (void)beginImportLayer:(NSString *)layer packs:(NSArray<NSString *> *)packs {
+    NSString *support = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES)[0] stringByAppendingPathComponent:@"acnh"];
+    NSString *destination = [support stringByAppendingPathComponent:layer];
+    NSString *staging = [destination stringByAppendingString:@".dm-pack-staging"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    plog("assets-import: 开始 layer=%s packs=%lu destination=%s",
+         layer.UTF8String, (unsigned long)packs.count, destination.UTF8String);
+    if ([fm fileExistsAtPath:staging]) {
+        NSError *removeError = nil;
+        if (![fm removeItemAtPath:staging error:&removeError]) {
+            plog("assets-import: 清理 staging 失败 %s", removeError.localizedDescription.UTF8String);
+            self.importState.text = [NSString stringWithFormat:@"上一次导入的临时目录清理失败：%@", removeError.localizedDescription];
+            return;
+        }
+    }
+    self.importing = YES;
+    self.cancelImportState = [NSMutableDictionary dictionary];
+    self.import.enabled = YES; [self.import setTitle:@"取消导入" forState:UIControlStateNormal];
+    self.progress.hidden = NO; self.progress.progress = 0;
+    self.importState.text = [NSString stringWithFormat:@"正在导入 %@（%lu 个包）…", layer, (unsigned long)packs.count];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableArray<NSString *> *args = [NSMutableArray array];
+        for (NSString *p in packs) [args addObject:p];
+        char why[1024] = "资源包导入未完成";
+        const char **paths = calloc(args.count, sizeof(char *));
+        for (NSUInteger i = 0; i < args.count; i++) paths[i] = args[i].fileSystemRepresentation;
+        AcnhPackImportContext context = {
+            .controller = self,
+            .cancelState = self.cancelImportState,
+            .layer = layer
+        };
+        int result = dm_pack_extract(paths, args.count, staging.fileSystemRepresentation,
+            acnh_pack_progress, acnh_pack_cancelled, &context, why, sizeof why);
+        free(paths);
+        plog("assets-import: extract result=%d staging=%s reason=%s",
+             result, staging.UTF8String, why);
+        if (result == DM_PACK_OK) {
+            plog("assets-import: 开始发布 staging=%s destination=%s", staging.UTF8String, destination.UTF8String);
+            result = dm_pack_publish(staging.fileSystemRepresentation, destination.fileSystemRepresentation, why, sizeof why);
+            plog("assets-import: 发布 result=%d reason=%s", result, why);
+        }
+        int final = result;
+        NSString *reason = @(why);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self finishImportLayer:layer result:final reason:reason];
+        });
+    });
+}
+- (void)retryTap {
+    char why[2048];
+    NSString *r = g_acnh ? acnh_romfs_locate(why, sizeof why) : d3_romfs_locate(why, sizeof why);
+    if (!r) {
+        plog("assets: %s 重试时资源仍不可用（%s）", g_acnh ? "ACNH" : "Diablo III", why);
+        return;
+    }
+    plog("assets: %s 资源就绪，就地起宿主", g_acnh ? "ACNH" : "Diablo III");
+    g_need_assets = 0;
+    // Re-run the native profile bootstrap now that the imported layers exist:
+    // the first launch intentionally skipped host preload and environment
+    // setup so the repair page could remain usable.
+    boot_prepare();
+    self.view = front_ios_view(self.view.window.windowScene.coordinateSpace.bounds);
+    [self setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
+    [self setNeedsUpdateOfHomeIndicatorAutoHidden];
+    host_start();
+    if (g_host_up) front_ios_focus_event(3);
+}
+@end
+static void assets_handoff(UIWindow *w) {
+    g_no_bc = 0;
+    g_need_assets = 1;
+    w.rootViewController = g_native_game() ? [AcnhAssetsVC new] : [AssetVC new];
+}
 @interface SceneDelegate : UIResponder <UIWindowSceneDelegate>
 @property (strong, nonatomic) UIWindow *window;
 @end
@@ -1071,7 +1594,7 @@ static void astc_handoff(UIWindow *w) {   // 补充包到位（玩家刚拷好 /
     vc.view.backgroundColor = UIColor.blackColor;
     if ([g_mode isEqualToString:@"boot"] && g_block_title) { vc = [BlockVC new]; vc.view.backgroundColor = UIColor.blackColor; }   // 图形芯片不支持 / 安装包不完整：只弹框 | Graphics chip not supported / install package incomplete: only show the message
     else if ([g_mode isEqualToString:@"boot"] && g_no_bc) { vc = [NoBcVC new]; vc.view.backgroundColor = UIColor.blackColor; }   // 本机型不支持：只弹框 | This device model is not supported: only show an alert
-    else if ([g_mode isEqualToString:@"boot"] && g_need_assets) vc = [AssetVC new];   // 资源包没到：下载界面 | Asset pack not here yet: download screen
+    else if ([g_mode isEqualToString:@"boot"] && g_need_assets) vc = g_native_game() ? [AcnhAssetsVC new] : [AssetVC new];   // 按 profile 显示资源修复页 | show the profile-specific asset screen
     else if ([g_mode isEqualToString:@"boot"]) vc.view = front_ios_view(ws.coordinateSpace.bounds);   // 图形后端出图的层（不叠任何控件） | The layer the graphics backend presents into (no widgets stacked on it)
     else if ([g_mode isEqualToString:@"blank"]) { UIView *front_ios_blank_view(CGRect); vc.view = front_ios_blank_view(ws.coordinateSpace.bounds); }   // 发热负对照 | Heat negative control
     else {   // 探针模式：屏上标出模式名 | Probe mode: show the mode name on screen
@@ -1171,6 +1694,8 @@ static void bg_relaunch_test(void) {
 
 int main(int argc, char *argv[]) {
     g_T[2] = since_start();
+    if (g_acnh) setenv("DM_GAME_PROFILE", "acnh", 1);
+    else if (g_d3) setenv("DM_GAME_PROFILE", "d3", 1);
     // 文件描述符上限：iOS 进程缺省软上限 256，而游戏进局后常开约 255 个（数据文件、存档、日志、Metal 缓存…），差一个就满——
     // 满了以后任何 open 都失败：存档读不出（首页变成建角页）、Documents 里的文件读不到（NSPOSIXErrorDomain 24 Too many open files）。
     // 之前没撞上是因为从 devicectl 启动时系统有时给 2560。启动第一件事把软上限提到 4096（不超过硬上限）
@@ -1229,7 +1754,7 @@ int main(int argc, char *argv[]) {
         }
         metal_cache_report_and_clean();
         char why[2048];
-        { id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); g_no_bc = !dev.supportsBCTextureCompression || getenv("DM_TEST_NO_BC");
+        { id<MTLDevice> dev = MTLCreateSystemDefaultDevice(); g_no_bc = !g_native_game() && (!dev.supportsBCTextureCompression || getenv("DM_TEST_NO_BC"));
           // 图形层要 Metal 3（参数缓冲里直接写 gpuAddress 的无绑定用法）：A14 / M1（Apple7 家族）起才有，A13 及更早不支持。不支持就不起游戏、弹框说明（不再走到解包 / 建管线时闪退）。
           // 测试开关 DM_TEST_NO_METAL3=1 当成不支持
           // The graphics layer needs Metal 3 (bindless use that writes gpuAddress directly into argument buffers): available from A14 / M1 (the Apple7 family); A13 and earlier do not support it. If unsupported, do not start the game and show a message (instead of crashing later while unpacking / building pipelines).
@@ -1238,16 +1763,21 @@ int main(int argc, char *argv[]) {
               g_block_title = T("dmGpuOldTitle"); g_block_msg = T("dmGpuOldMsg"); g_block_why = @"图形芯片不支持 Metal 3";
               plog("boot: 🔴 显卡 %s 不支持 Metal 3%s——不起游戏，弹框说明", dev.name.UTF8String, getenv("DM_TEST_NO_METAL3") ? "（测试开关 DM_TEST_NO_METAL3）" : ""); }
           plog("boot: 显卡 %s，BC 压缩格式%s", dev.name.UTF8String, g_no_bc ? (getenv("DM_TEST_NO_BC") ? "按测试开关 DM_TEST_NO_BC 当成不支持" : "不支持——不起游戏，弹框说明后退出") : "支持"); }
-        if (g_no_bc) {   // 不支持 BC：有配套的老机型补充包就照常起（覆盖层换 ASTC 版，见 boot_prepare），没有就弹框 | BC not supported: if the matching Legacy Device Pack is present, start as usual (the overlay switches to the ASTC version, see boot_prepare); otherwise show an alert
+        if (!g_native_game() && g_no_bc) {
             NSString *d = astc_pack_locate(g_astc_why, sizeof g_astc_why);
             if (d) { g_astc_dir = d; g_no_bc = 0; plog("boot: 用老机型补充包 %s", d.UTF8String); }
             else plog("boot: 老机型补充包未就绪：%s", g_astc_why);
         }
-        NSString *pb = g_block_title ? nil : pack_check();
+        NSString *pb = (!g_native_game() && !g_block_title) ? pack_check() : nil;
         if (pb) { g_block_title = T("dmPackBadTitle"); g_block_msg = [NSString stringWithFormat:@"%@\n\n%@", pb, T("dmPackBadHow")]; g_block_why = @"安装包自检没过"; }
         if (g_block_title) {}   // 起不了游戏：不起宿主，场景里弹框（BlockVC） | The game cannot start: do not start the host; show a message in the scene (BlockVC)
         else if (g_no_bc) {}
-        else if (getenv("DM_ASSETS_TEST") || getenv("DM_TEST_BA")) { g_need_assets = 1; plog("boot: DM_ASSETS_TEST——强制走资源下载界面再就地起宿主（测这条路径）"); }
+        else if (!g_native_game() && (getenv("DM_ASSETS_TEST") || getenv("DM_TEST_BA"))) { g_need_assets = 1; plog("boot: DM_ASSETS_TEST——强制走资源下载界面再就地起宿主（测这条路径）"); }
+        else if (g_acnh || g_d3) {
+            NSString *r = g_acnh ? acnh_romfs_locate(why, sizeof why) : d3_romfs_locate(why, sizeof why);
+            if (r) plog("boot: %s 资源就绪，宿主等场景到前台再装载", g_acnh ? "ACNH" : "Diablo III");
+            else { g_need_assets = 1; plog("boot: ACNH 资源还没到（%s）", why); }
+        }
         else if (romfs_locate(why, sizeof why)) plog("boot: 游戏资源就绪，宿主等场景到前台再装载");
         else { g_need_assets = 1; plog("boot: 游戏资源还没到（%s），先显示资源下载界面", why); }
     } else metal_cache_report_and_clean();

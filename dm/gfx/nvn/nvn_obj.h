@@ -1,8 +1,12 @@
 // NVN 宿主侧对象布局与命令记录格式：hle_nvn.c（接口层，写）与 nvn_mtl.m（Metal 回放层，读）共用。
-// 对象就地存在游戏分配的 NVN 对象内存里，大小不超过 nvn.h 的保留大小（FITS 静态断言）。
+// 小对象就地存在游戏分配的 NVN 对象内存里，大小不超过 nvn.h 的保留大小（FITS 静态断言）。
+// 贴图 / 程序对象只在游戏对象里保存 8 字节宿主句柄，完整状态放在宿主堆上；不同游戏给 NVNtexture / NVNprogram
+// 的实际分配大小并不都等于头文件的保留大小，完整宿主结构直接写进游戏对象会越界。
 // 状态对象（Blend / Color / … 4–0x18 字节）是游戏按值拷贝的小结构，布局用位域就地打包。
 // NVN host-side object layout and command record format: shared by hle_nvn.c (interface layer, writes) and nvn_mtl.m (Metal replay layer, reads).
-// Objects are stored in place in the NVN object memory allocated by the game, with size not exceeding the reserved size in nvn.h (FITS static assertion).
+// Small objects are stored in place in the NVN object memory allocated by the game, with size not exceeding the reserved size in nvn.h (FITS static assertion).
+// Texture / program objects store only an 8-byte host handle in the game object, with the complete state on the host heap; the actual NVNtexture / NVNprogram
+// allocation sizes differ between games and are not all equal to the header's reserved sizes, so writing the complete host structure in place can overflow.
 // State objects (Blend / Color / ... 4–0x18 bytes) are small structs the game copies by value; their layout is packed in place with bit-fields.
 #pragma once
 #include <stdint.h>
@@ -23,38 +27,50 @@ typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; } queue_t;   
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
 typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; } pool_t;                FITS(pool_t, NVNmemoryPool);
 
+typedef struct { NVNdevice *dev; const pool_t *pool; int64_t off; size_t size; } buf_builder_t; FITS(buf_builder_t, NVNbufferBuilder);
+typedef struct { uint32_t magic; pool_t *pool; int64_t off; size_t size; } buf_t;              FITS(buf_t, NVNbuffer);
+
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // 贴图 / 采样器描述符池 | Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
 
 typedef struct {
     NVNdevice *dev; nvn_texdesc d; pool_t *pool; int64_t off;
-    uint8_t has_layout, layout[8];
+    uint8_t has_layout, layout[8]; const void *packaged_data;
 } tex_builder_t;                                                                             FITS(tex_builder_t, NVNtextureBuilder);
 typedef struct {
     uint32_t magic; nvn_texdesc d; nvn_texlayout L; uint8_t *mem; pool_t *pool; int64_t off; uint8_t has_layout, layout[8];
+    const void *packaged_data;
     uint64_t serial;                     // 初始化序号：回放层按它在宿主表里找 MTLTexture（游戏可能按值拷贝对象，不能存对象指针） | Initialization serial: the replay layer uses it to find the MTLTexture in the host table (the game may copy the object by value, so object pointers cannot be stored)
     const void *snap;                    // 本序号的不可变副本（hle_nvn.c snap_tex）：命令载荷存它，不存游戏对象地址 | This serial's immutable snapshot (hle_nvn.c snap_tex): command payloads store it, not the game object's address
-} tex_t;                                                                                     FITS(tex_t, NVNtexture);
-typedef struct { uint8_t set_levels, set_layers, set_format, set_target; int32_t base_level, nlevels, min_layer, nlayers, format, target; } view_t;
+} tex_t;                                                                                     // 宿主对象，不放进游戏分配的内存 | Host object; never stored in game-allocated memory
+typedef struct {
+    uint8_t set_levels, set_layers, set_format, set_target, set_swizzle, set_depth_stencil_mode;
+    int32_t base_level, nlevels, min_layer, nlayers, format, target, depth_stencil_mode;
+    uint8_t swizzle[4];
+} view_t;
 FITS(view_t, NVNtextureView);
 
 // 采样器参数（builder 与对象共用一份）
 // Sampler parameters (one copy shared by builder and object)
-typedef struct { uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func; float lod_min, lod_max, lod_bias, aniso, border[4]; } samp_par;   // 枚举值都 < 256 | Enum values are all < 256
+typedef struct { uint8_t minf, magf, ws, wt, wr, cmp_mode, cmp_func, border_kind, reduction; float lod_min, lod_max, lod_bias, aniso, border[4]; } samp_par;   // 枚举值都 < 256 | Enum values are all < 256
 typedef struct { NVNdevice *dev; samp_par p; } samp_builder_t;                                FITS(samp_builder_t, NVNsamplerBuilder);
 typedef struct { uint32_t magic; samp_par p; } samp_t;                                        FITS(samp_t, NVNsampler);
 
-typedef struct { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; const void *snap; } prog_t;     FITS(prog_t, NVNprogram);   // serial：回放层解析结果的表键；snap：本序号的不可变副本（同 tex_t） | serial: table key for the replay layer's resolved results; snap: this serial's immutable snapshot (same as tex_t)
+typedef struct {
+    uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; const void *snap;
+    uint8_t key[6][8];   // ACNH：sha256(完整控制段 + 完整代码区) 的前 8 字节；D2R 不用 | ACNH: first 8 bytes of sha256(full control + full code); unused by D2R
+} prog_t;                                                                                     // 宿主对象，不放进游戏分配的内存 | Host object; never stored in game-allocated memory
+                                                                                             // serial：回放层解析结果的表键；snap：本序号的不可变副本（同 tex_t） | serial: table key for the replay layer's resolved results; snap: this serial's immutable snapshot (same as tex_t)
 
 typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;                            FITS(sync_t, NVNsync);
 typedef struct { const pool_t *pool; int64_t off; } ev_builder_t;                             FITS(ev_builder_t, NVNeventBuilder);
 typedef struct { uint32_t magic; volatile uint32_t *val; } ev_t;                              FITS(ev_t, NVNevent);
 
-typedef struct { NVNdevice *dev; void *native; int32_t ntex, interval; NVNtexture *tex[4]; } win_builder_t;
+typedef struct { NVNdevice *dev; void *native; int32_t ntex, interval, active; uint8_t has_active; NVNtexture *tex[4]; } win_builder_t;
 FITS(win_builder_t, NVNwindowBuilder);
 // avail[i]：交换链第 i 张可再次获取的时刻（ns，单调时钟）= 它的显示时刻 + 一个出图周期；pace：本窗口的出图节拍器目标时刻
 // avail[i]: time at which swapchain image i can be acquired again (ns, monotonic clock) = its display time + one present period; pace: target time of this window's present pacer
-typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; } win_t;   // ticket[i]：第 i 张最近一次出图的票号 | ticket[i]: ticket of the most recent present of image i
+typedef struct { uint32_t magic; void *native; int32_t ntex, interval, active, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; } win_t;   // ticket[i]：第 i 张最近一次出图的票号 | ticket[i]: ticket of the most recent present of image i
 FITS(win_t, NVNwindow);
 
 // 命令缓冲：命令写进游戏给的命令内存（AddCommandMemory），句柄 = 段首地址；用完回调游戏补内存
@@ -63,15 +79,16 @@ typedef struct {
     uint32_t magic, recording;
     uint8_t *cur, *end;                  // 当前命令内存段的写指针 / 段尾 | Write pointer / end of the current command memory segment
     uint8_t *begin;                      // 本次录制的 BEGIN 记录 | BEGIN record of this recording
-    PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb; void *cb_data;
+    PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb; void *cb_data; uint8_t cb_enabled;
     NVNdevice *dev;
+    size_t command_size, command_used, control_size, control_used;
 } cmd_t;                                                                                     FITS(cmd_t, NVNcommandBuffer);
 
 // ---------- 状态对象（默认值按 NVN / GL 默认） ----------
 // ---------- State objects (defaults follow the NVN / GL defaults) ----------
 typedef struct { uint32_t blend_en : 8, logic_op : 4, alpha_func : 4; } color_st;            FITS(color_st, NVNcolorState);
 typedef struct { uint32_t mask; } chmask_st;            /* 每目标 4 位：r=1 g=2 b=4 a=8，置位 = 写 | 4 bits per target: r=1 g=2 b=4 a=8, bit set = write */ FITS(chmask_st, NVNchannelMaskState);
-typedef struct { uint64_t target : 3, src_rgb : 7, dst_rgb : 7, src_a : 7, dst_a : 7, eq_rgb : 3, eq_a : 3; } blend_st;
+typedef struct { uint64_t target : 3, src_rgb : 7, dst_rgb : 7, src_a : 7, dst_a : 7, eq_rgb : 3, eq_a : 3, advanced : 8; } blend_st;
 FITS(blend_st, NVNblendState);
 typedef struct { uint8_t enable, samples, a2c, a2c_dither, raster_samples, cov_mod, cov2color_en, cov2color_out, sl_en, sl_grid; } ms_st;
 FITS(ms_st, NVNmultisampleState);
@@ -93,16 +110,21 @@ enum {
     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_COUNT_
+    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX,
+    OP_COND, OP_DRAW_INDIRECT, OP_VIEWPORT_SWIZZLES, OP_SCISSORS, OP_DEPTH_RANGES, OP_DISCARD_COLOR,
+    OP_REPORT_VALUE, OP_DOWNSAMPLE, OP_RASTERIZER_DISCARD, OP_DEPTH_CLAMP,
+    OP_LINE_POINT, OP_TFB_BEGIN, OP_COUNT_
 };
 // 载荷（紧跟 op_hdr）。贴图 / 程序指针都指向录制时按序号留下的不可变副本（snap_tex / snap_prog），游戏之后改写或重建对象不影响已录的命令
 // Payload (right after op_hdr). Texture / program pointers point to the immutable snapshots kept by serial at record time (snap_tex / snap_prog); later rewrites or rebuilds of the object by the game do not affect recorded commands
 typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
-typedef struct { int32_t index, mask; float rgba[4]; } p_clear_color;
+typedef struct { int32_t index, mask, is_int; union { float rgba[4]; int32_t i[4]; uint32_t u[4]; } c; } p_clear_color;
 typedef struct { float depth; int32_t depth_mask, stencil, stencil_mask; } p_clear_ds;
 typedef struct { int32_t first, n; float v[16][6]; } p_viewports;          // x, y, w, h, 近, 远（近远由 DEPTH_RANGE 覆盖） | x, y, w, h, near, far (near and far are overridden by DEPTH_RANGE)
 typedef struct { int32_t x, y, w, h; } p_scissor;
+typedef struct { int32_t first, n; int32_t r[16][4]; } p_scissors;
 typedef struct { float n, f; } p_depth_range;
+typedef struct { int32_t first, n; uint8_t s[16][4]; } p_viewport_swizzles;
 typedef struct { const prog_t *prog; int32_t stages; } p_bind_program;
 typedef struct { int32_t kind; uint8_t bytes[0x18]; } p_bind_state;      // kind：0 blend 1 color 2 chmask 3 ms 4 poly 5 ds
 typedef struct { int32_t first, n; uint32_t st[16]; } p_bind_vattr;
@@ -112,8 +134,16 @@ typedef struct { int32_t stage, index; uint64_t addr, size; } p_bind_buf;  // UB
 typedef struct { int32_t stage, first, n; uint64_t h[32]; } p_bind_handles; // 分离贴图 / 采样器句柄 | Separate texture / sampler handles
 typedef struct { int32_t face, value_mask, mask, ref, which; } p_stencil;  // which：0 值掩码 1 写掩码 2 参考值 | which: 0 value mask 1 write mask 2 reference value
 typedef struct { float factor, units, clamp; } p_poly_offset;
-typedef struct { int32_t prim, first, count; } p_draw;
+typedef struct { int32_t prim, first, count, instances, base_instance; } p_draw;
 typedef struct { int32_t prim, itype, count, base_vertex, base_instance, instances; uint64_t ibuf; } p_draw_idx;
+typedef struct { int32_t prim, itype, indexed; uint64_t addr; } p_draw_indirect;
+typedef struct { int32_t mode; uint64_t addr; } p_cond;
+typedef struct { uint32_t value; uint64_t addr; } p_report_value;
+typedef struct { const tex_t *src, *dst; } p_downsample;
+typedef struct { int32_t index; } p_discard;
+typedef struct { uint32_t value; } p_bool;
+typedef struct { int32_t which; float value; } p_line_point;
+typedef struct { uint64_t addr; } p_tfb_begin;
 typedef struct { int32_t x, y, z; uint64_t caller; } p_dispatch;   // caller：游戏调用点返回地址（定位派发者） | caller: return address of the game call site (to locate the dispatcher)
 typedef struct { const dpool_t *pool; } p_set_pool;
 typedef struct { uint64_t src; const tex_t *tex; view_t view; uint8_t has_view; NVNcopyRegion r; int32_t flags; } p_copy_b2t;
@@ -172,6 +202,8 @@ void mtl_create_stats(uint64_t *lib, uint64_t *pso);   // 累计：提交线程�
 // CPU 读贴图：level / layer0 起，按 row / img 字节步长写进 dst
 // CPU texture read: starting at level / layer0, written into dst with row / img byte strides
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
+void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer, const NVNcopyRegion *r,
+                      const void *src, size_t row, size_t img);
 // 描述符池登记（贴图号 / 采样器号 → 对象快照）、程序释放
 // Descriptor pool registration (texture ID / sampler ID → object snapshot), program release
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v);

@@ -57,6 +57,7 @@
 #include "dmsh_chain.h"   // DMSH_CHAIN：本源码树期望的 B 着色器库翻译链版本 | DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree
 #include "nvn_hmap.h"
 #include "../../host/dm.h"
+#include "../../host/dm_game.h"
 #import <CommonCrypto/CommonDigest.h>
 #include <stdarg.h>
 #include <mach-o/dyld.h>
@@ -1435,6 +1436,40 @@ static id<MTLTexture> tex_mtl(const tex_t *ct) {
     serial_put(t->serial, mt);
     return mt;
 }
+// CPU TextureWriteTexels 的后端：NVN 的普通贴图在 Metal 上是 private texture，不能只改内存池；
+// 用独立的共享 staging buffer + blit 把写入区域同步到当前 MTLTexture。数组 / cube 由调用方逐层调用，
+// 3D 贴图一次拷全部深度。
+// Backend for CPU TextureWriteTexels: ordinary NVN textures are private Metal textures, so
+// changing only the pool is insufficient. Copy through an independent shared staging buffer.
+// Arrays / cubes are issued one layer at a time; 3D textures copy the complete depth range.
+void mtl_write_texels(const tex_t *t, unsigned level, unsigned layer, const NVNcopyRegion *r,
+                      const void *src, size_t row, size_t img) {
+    if (!t || !r || !src || !row || !img) return;
+    id<MTLTexture> dst = tex_mtl(t);
+    if (!dst) { MLOG("【红】TextureWriteTexels 建不出目标 MTLTexture ser=%llu", (unsigned long long)t->serial); return; }
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    if (!bpb || r->width <= 0 || r->height <= 0 || r->depth <= 0) return;
+    uint32_t nz = t->d.target == 2 ? (uint32_t)r->depth : 1;
+    size_t bytes = img * nz;
+    id<MTLBuffer> stg = [g_dev newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared];
+    if (!stg) { MLOG("【红】TextureWriteTexels 建 staging 失败 %zu B", bytes); return; }
+    res_add(stg); res_commit();
+    id<MTLCommandBuffer> cb = q_cb();
+    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+    MTLSize size = MTLSizeMake((NSUInteger)r->width, (NSUInteger)r->height, nz);
+    MTLOrigin origin = MTLOriginMake((NSUInteger)r->xoffset, (NSUInteger)r->yoffset, (NSUInteger)r->zoffset);
+    if (t->d.target == 2) {
+        [be copyFromBuffer:stg sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:size
+                 toTexture:dst destinationSlice:0 destinationLevel:level destinationOrigin:origin];
+    } else {
+        size.depth = 1; origin.z = 0;
+        [be copyFromBuffer:stg sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:size
+                 toTexture:dst destinationSlice:layer destinationLevel:level destinationOrigin:origin];
+    }
+    [be endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if (cb.error) MLOG("【红】TextureWriteTexels blit 失败：%s", cb.error.localizedDescription.UTF8String);
+    res_remove(stg);
+}
 // 内存读数行（常开、低频、封顶）：常驻内存、显卡已分配、延迟释放队列、驻留集对象数、在册内存池数 / 峰值 / 跟踪表容量、贴图重传累计、游戏堆总量 / 余量 / 最大可分配块（宿主 dm_guest_heap_stat）、离系统内存上限还有多少（仅 iOS）。
 // 用途：定「没有日志的闪退」——系统按内存杀进程前不给任何通知，只有事先留下的读数能说明是哪个数一路往上涨。
 // 每 300 帧由帧钩子调一次；常驻、显卡已分配变了 ≥ 64 MB，或游戏堆余量、最大可分配块变了 ≥ 16 MB（主堆平时只剩约 100 MB）才打，否则每 3000 帧打一行；一局封顶 400 行。全是整数（帧钩子在客体线程的小栈上，不用浮点格式）
@@ -2429,9 +2464,16 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // 只在提�
     if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
     shmap_load();
     NvProg *o = [NvProg new];
-    for (unsigned i = 0; i < p->nstage; i++) {
-        uint8_t md[32]; CC_SHA256(p->sd[i].control, 0x880, md);
-        NSString *k = [NSString stringWithFormat:@"%02x%02x%02x%02x%02x%02x%02x%02x", md[0], md[1], md[2], md[3], md[4], md[5], md[6], md[7]];
+    for (unsigned i = 0; i < p->nstage && i < sizeof p->key / sizeof p->key[0]; i++) {
+        uint8_t md[32]; NSString *k;
+        if (dm_game_is_acnh()) {
+            k = [NSString stringWithFormat:@"%02x%02x%02x%02x%02x%02x%02x%02x",
+                 p->key[i][0], p->key[i][1], p->key[i][2], p->key[i][3],
+                 p->key[i][4], p->key[i][5], p->key[i][6], p->key[i][7]];
+        } else {
+            CC_SHA256(p->sd[i].control, 0x880, md);
+            k = [NSString stringWithFormat:@"%02x%02x%02x%02x%02x%02x%02x%02x", md[0], md[1], md[2], md[3], md[4], md[5], md[6], md[7]];
+        }
         NSString *zh = g_shmap[k];
         if (!zh) {   // 不在包里：查 main 本体内嵌的计算核（nvn_builtin.h） | Not in the package: look up the compute kernels embedded in the main body (nvn_builtin.h)
             NvShader *b = builtin_get(k.UTF8String);
@@ -3825,7 +3867,7 @@ static void hoist_try(void) {
                     if (c->index < 0 || c->index >= g->rt->n || !g->rt->color[c->index] || c->mask != 0xf) return;
                     const tex_t *t = g->rt->color[c->index];
                     if (has_sc && !(sc.x <= 0 && sc.y <= 0 && sc.x + sc.w >= (int)t->d.width && sc.y + sc.h >= (int)t->d.height)) return;
-                    g->clear_c[c->index] = 1; g->cc[c->index] = MTLClearColorMake(c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]); }
+                    g->clear_c[c->index] = 1; g->cc[c->index] = c->is_int == 1 ? MTLClearColorMake(c->c.i[0], c->c.i[1], c->c.i[2], c->c.i[3]) : c->is_int == 2 ? MTLClearColorMake(c->c.u[0], c->c.u[1], c->c.u[2], c->c.u[3]) : MTLClearColorMake(c->c.rgba[0], c->c.rgba[1], c->c.rgba[2], c->c.rgba[3]); }
                 else { const p_clear_ds *c = a; if (!g->rt->depth) return;
                     if (c->depth_mask) { g->clear_d = 1; g->cd = c->depth; } if (c->stencil_mask) { g->clear_s = 1; g->cs = (uint32_t)c->stencil; } }
                 g->sc = sc; g->has_sc = has_sc; g->ops[g->nops++] = p; break; }
@@ -4257,7 +4299,7 @@ static void fuse_try(void) {
             case OP_CLEAR_COLOR: { const p_clear_color *c = a; if (ncl >= 8 || c->index < 0 || c->index >= r2->n || !r2->color[c->index] || c->mask != 0xf) return;
                 const tex_t *t = r2->color[c->index];
                 if (has_sc && !(sc.x <= 0 && sc.y <= 0 && sc.x + sc.w >= (int)t->d.width && sc.y + sc.h >= (int)t->d.height)) return;
-                clr[c->index] = 1; cc[c->index] = MTLClearColorMake(c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]); cl[ncl++] = p; break; }
+                clr[c->index] = 1; cc[c->index] = c->is_int == 1 ? MTLClearColorMake(c->c.i[0], c->c.i[1], c->c.i[2], c->c.i[3]) : c->is_int == 2 ? MTLClearColorMake(c->c.u[0], c->c.u[1], c->c.u[2], c->c.u[3]) : MTLClearColorMake(c->c.rgba[0], c->c.rgba[1], c->c.rgba[2], c->c.rgba[3]); cl[ncl++] = p; break; }
             case OP_CLEAR_DS: { const p_clear_ds *c = a; if (ncl >= 8 || !r2->depth) return;
                 if (c->depth_mask) { cd_f = 1; cdv = c->depth; } if (c->stencil_mask) { cs_f = 1; csv = (uint32_t)c->stencil; } cl[ncl++] = p; break; }
             default: break;
@@ -5514,7 +5556,7 @@ void mtl_exec(const uint8_t *p) {
                 if (g_rt_merged) rp_end();   // 续用的通道里来了清除：在此结束，清除照旧挂到下一个通道开头 | A clear arrived in a continued render pass: end it here, and the clear is attached to the start of the next render pass as usual
                 if (c->index < 0 || c->index >= R.rt.n || !R.rt.color[c->index]) { RED_ONCE(5, "清色目标 %d 无效", c->index); break; }
                 if (g_enc || c->mask != 0xf || !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index])) { RED_ONCE(6, "通道中途 / 部分掩码 / 部分剪裁的清色未实现（首例 掩码 %#x）", c->mask); break; }
-                R.clear_c[c->index] = 1; R.cc[c->index] = MTLClearColorMake(c->rgba[0], c->rgba[1], c->rgba[2], c->rgba[3]);
+                R.clear_c[c->index] = 1; R.cc[c->index] = c->is_int == 1 ? MTLClearColorMake(c->c.i[0], c->c.i[1], c->c.i[2], c->c.i[3]) : c->is_int == 2 ? MTLClearColorMake(c->c.u[0], c->c.u[1], c->c.u[2], c->c.u[3]) : MTLClearColorMake(c->c.rgba[0], c->c.rgba[1], c->c.rgba[2], c->c.rgba[3]);
                 break;
             }
             case OP_CLEAR_DS: {

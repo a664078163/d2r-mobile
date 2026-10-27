@@ -26,6 +26,7 @@ import lz4.block
 from capstone import *
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
+D3_PROFILE = os.environ.get('DM_GAME_PROFILE', '').lower() in ('d3', 'diablo3', 'diablo-3', 'diablo_3')
 d = open(src, 'rb').read()
 assert d[:4] == b'NSO0'
 flags = struct.unpack_from('<I', d, 0xc)[0]
@@ -164,9 +165,24 @@ OBS = {'db0507f36b84200ac05f75d76ed5026f': [
      '原指令 sub sp, sp, #0x60'),
 ]}
 BUILD_ID = d[0x40:0x50].hex()
+# 禁止在连续 x18 数据流中保留单条 Apple 原生指令。0x37c7c40 曾短暂进入这份
+# 例外表，但其结果供紧随其后的 K18 读取使用；只保留一条原生指令会让后续
+# 指令读到旧 K18，破坏 allocator 地址计算。保留空表作为显式契约。
+# Never preserve an isolated native x18 instruction inside a contiguous x18
+# dataflow. 0x37c7c40 was briefly listed here, but its result feeds the next
+# K18 read; keeping only that instruction native makes the consumer observe the
+# stale K18 value and breaks allocator address calculation. Keep an explicit
+# empty table as the contract.
+ACNH_NATIVE_X18 = set()
+
+
+def keep_native_x18(module_name, build_id, offset):
+    return (module_name, build_id, offset) in ACNH_NATIVE_X18
+
+
 # 构建期产品规则：旧原资源/对拍域默认不变；触屏版单独出新版本，不在运行时写客体代码。
 # Build-time product rules: the old original-resource / comparison domain is unchanged by default; the touchscreen version is issued separately as a new version, and guest code is not written at runtime.
-RULESET = os.environ.get('DM_RULESET', 'native')
+RULESET = 'native' if D3_PROFILE else os.environ.get('DM_RULESET', 'native')
 assert RULESET in ('native', 'touch-run-v4'), f'未知规则域 {RULESET}'
 RULE_BUILD = 'db0507f36b84200ac05f75d76ed5026f'
 RULE_RUN = RULESET == 'touch-run-v4' and NAME == 'main'
@@ -174,7 +190,7 @@ if RULE_RUN:
     import hashlib
     assert BUILD_ID == RULE_BUILD, f'Run规则构建号不符 {BUILD_ID}'
     RULE_ORIG_SHA = hashlib.sha256(IMG).hexdigest()
-cuts = list(CUTS.get(BUILD_ID, []))
+cuts = [] if D3_PROFILE else list(CUTS.get(BUILD_ID, []))
 # 触屏版规则域默认同时带宿主私有门；规则闸门可显式关闭，保留同一出包入口和规则域。
 # The touchscreen rule domain by default also carries the host-private gates; the rule gate check can turn them off explicitly, keeping the same packaging entry point and rule domain.
 PRIVATE_GATES = os.environ.get("DM_PRIVATE_GATES", "1") != "0"
@@ -292,6 +308,19 @@ def regset(ins):
 def num(name):
     m = re.fullmatch(r'[xw](\d+)', name or ''); return int(m.group(1)) if m else None
 def has18(ins): return re.search(r'\b[xw]18\b', ins.op_str) is not None
+def writes18(ins):
+    """指令是否写 x18/w18。不能从操作数文本猜：`add x0, x18, x15` 只读 x18，而
+    `adds w18, w18, w16` 写 x18 且带 NZCV。Capstone 的 regs_access 对两者都准确。
+    | Whether the instruction writes x18/w18. Operand text is not enough:
+    `add x0, x18, x15` only reads x18, while `adds w18, w18, w16` writes x18 and NZCV.
+    Capstone regs_access is accurate for both."""
+    # Capstone marks the first operand of flag-only compare aliases (cmp/cmn/
+    # tst/ccmp and their conditional variants) as written because it models
+    # NZCV, but those instructions never modify their register operands.
+    if ins.mnemonic in {'cmp', 'cmn', 'tst', 'ccmp', 'ccmn'}:
+        return False
+    _, wr = ins.regs_access()
+    return any(num(ins.reg_name(r)) == 18 for r in wr)
 def regs_in(ins):
     s = {int(n) for n in re.findall(r'\b[xw](\d+)\b', ins.op_str)}
     try:
@@ -327,6 +356,17 @@ def sp_delta(ins):
     return 0
 
 def site_plain(ins):
+    # D3 uses register-to-SP moves (most notably `mov sp, x18`) for dynamic
+    # stack pivots.  They are not write-back addressing modes, so the generic
+    # save/restore trampoline cannot restore its frame after executing them.
+    # Load the emulated x18 into a scratch register, perform the original SP
+    # write, and branch out immediately while leaving the new SP in effect.
+    if has18(ins) and re.match(r'(sp|wsp),', ins.op_str):
+        S, T = pick(regs_in(ins))
+        start = here()
+        emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
+        emit(subst(ins, S)); emit(B(here(), ins.address + 4))
+        return start
     S, T = pick(regs_in(ins))
     dlt = sp_delta(ins)
     save = -16 if dlt == 0 else -112          # 改 sp 的指令会写到 sp 下方，暂存放到保留区深处 | Instructions that modify sp write below sp, so the scratch save is placed deep in the reserved area
@@ -334,7 +374,12 @@ def site_plain(ins):
     start = here()
     emit(STP(S, T, 31, save)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     emit(subst(ins, S))
-    emit(STRX(S, T))                 # 一律写回：capstone 会漏报写入（adds w18 实例） | Always write back: capstone can miss reporting a write (the adds w18 instance)
+    # 只有原指令真的写 x18 才回写。旧版一律回写，遇到 `add x0, x18, x15` 会把 x0
+    # 写进 K18；ACNH 的分配器窗口因此把空闲树根节点污染成 0，下一次分配即崩。
+    # | Write back only when the original instruction really writes x18. The old
+    # unconditional write stored x0 into K18 for `add x0, x18, x15`; ACNH's allocator
+    # window then poisoned the free-tree root with zero and crashed on the next allocation.
+    if writes18(ins): emit(STRX(S, T))
     emit(LDP(S, T, 31, save - dlt)); emit(B(here(), ins.address + 4))
     return start
 
@@ -478,7 +523,14 @@ def site_window(seg):
     ex_targets = []; words = []
     for k, x in enumerate(seg):
         w = struct.unpack('<I', x.bytes)[0]
-        if has18(x): w = subst(x, S)
+        if has18(x):
+            before = x.op_str
+            w = subst(x, S)
+            want = re.sub(r'\b([xw])18\b', lambda m: f'{m.group(1)}{S}', before)
+            got = dis(w, x.address).op_str
+            assert got == want, (
+                f'窗口 x18 替换改变了寄存器角色 {x.address:#x}: '
+                f'{x.mnemonic} {before} -> {got}，应为 {want}')
         m = x.mnemonic
         if m in ('cbz', 'cbnz', 'tbz', 'tbnz') or m.startswith('b.'):
             tgt = x.operands[-1].imm
@@ -500,8 +552,18 @@ def site_window(seg):
     # Up to r40 the fall-out exit was placed last: whenever a window contained a conditional jump to outside the window (the "compare not equal" exit of a compare-and-swap), a successful write fell into the first external exit = handled as a failed compare
     # (one operation done twice / a lock-free list popped more than once). The game has 6 such windows (main 0x1848eb8 / 0x1848f28 / 0x1848f84, sdk 0x2ea0fc / 0x2ea4cc / 0x2ea644);
     # windows whose only branch is a cbnz back into the window are not affected. The equivalence check used to never draw the "compare equal" direction at random, so it stayed green (equiv.py now forces both directions of window branches).
+    #
+    # 窗口内只保存模拟 x18 的原值，不保存原 x18 寄存器：原 x18 在 Apple 上不可用，
+    # 窗口内所有 x18 已替换成 S，出口只回写 S 到 K18。若把原 x18 寄存器也当活值
+    # 保存，反而会把 S 覆盖回不可用的值。
+    # | The window saves only the emulated x18 value, not the original x18 register:
+    # original x18 is unavailable on Apple, every x18 in the window is replaced by S,
+    # and exits write S back to K18. Saving the host's original x18 would overwrite S
+    # with an unusable value.
+    window_writes18 = any(writes18(x) for x in seg)
     for t in [hi] + ex_targets:
-        emit(STRX(S, T)); emit(LDP(S, T, 31, -16)); emit(B(here(), t)); emit(NOP)
+        if window_writes18: emit(STRX(S, T))
+        emit(LDP(S, T, 31, -16)); emit(B(here(), t)); emit(NOP)
     return start, lo, hi
 
 # ---- 函数边界（eh_frame_hdr）----
@@ -586,6 +648,9 @@ for a in sorted(kinds):
     k, arg = kinds[a]
     ins = dis(struct.unpack_from('<I', IMG, a)[0], a)
     if k == 'x18':
+        if keep_native_x18(NAME, BUILD_ID, a):
+            stat('native_x18')
+            continue
         m = ins.mnemonic
         if m == 'br': st = site_br(ins, *jumps[a]); stat('br')
         elif m in ('cbz', 'cbnz', 'tbz', 'tbnz'): st = site_cond(ins); stat('cond')
@@ -623,7 +688,7 @@ elif RULE_RUN:
     patch.extend(bytes(0x80))
     stat('private_gates_reserved')
 
-obs = list(OBS.get(BUILD_ID, []))
+obs = [] if D3_PROFILE else list(OBS.get(BUILD_ID, []))
 if RULE_RUN and PRIVATE_GATES:
     obs.append((0x43ecc8, 6, "b8686953", "private touch-run-v4 PRE-ldr; full800 host ABI"))
     obs.append((0x1237c60, 8, "d10143ff", "ui world anchor: camera world->screen entry (camera, point, out); host swaps x0 to a copy whose projection is shifted by the UI rect y (iPad UI kept 16:9 inside a taller screen), game camera untouched"))

@@ -90,6 +90,48 @@ HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "性能模式查询；与运行模�
 HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "设 CPU/GPU 频率档；宿主不调频", void, h_oe_SetPerfCfg, int mode, int cfg) {
     LOG("oe::SetPerformanceConfiguration mode=%d cfg=%#x（忽略）", mode, cfg);
 }
+// ACNH 的 CPU Boost 请求最终进入 applet/am 服务；宿主没有 CommonStateGetter 服务对象，
+// 放行 SDK 路径会解引用空指针。iOS 由系统调频，这里只截断请求。
+// ACNH's CPU Boost request ultimately enters the applet/am service. The host has no CommonStateGetter
+// service object, so letting the SDK path run dereferences a null pointer. iOS controls frequency; cut the request here.
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+    "_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE",
+    "ACNH 的 CPU Boost 走 applet 服务；宿主由 iOS 系统调频",
+    void, h_oe_SetCpuBoostMode, int mode) {
+    LOG("oe::SetCpuBoostMode %d（ACNH 宿主不调频）", mode);
+}
+
+/* ACNH asks oe for the expected system-volume balance during startup.  The
+   reference implementation reaches am's audio controller, which is outside
+   the mobile host boundary.  Keep the oe API stable with a neutral balance. */
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+    "_ZN2nn2oe24SetExpectedVolumeBalanceEff",
+    "ACNH 的期望音量平衡；宿主音频由 nn::audio 接管",
+    void, h_oe_SetExpectedVolumeBalance, float left, float right) {
+    (void)left; (void)right;
+}
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+    "_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_",
+    "ACNH 的期望音量平衡查询；返回中性平衡",
+    void, h_oe_GetExpectedVolumeBalance, float *left, float *right) {
+    if (left) *left = 1.0f;
+    if (right) *right = 1.0f;
+}
+
+/* ACNH's exit-request guard is implemented by nn::oe through am's
+   IApplicationProxy/self-controller.  The mobile host has no applet service;
+   keeping this section as a host-local no-op preserves the reference-counting
+   boundary without manufacturing an am proxy object. */
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+    "_ZN2nn2oe31EnterExitRequestHandlingSectionEv",
+    "ACNH 的退出请求保护区段；宿主无 applet 服务，接管为空操作",
+    void, h_oe_EnterExitRequest, void) {
+}
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+    "_ZN2nn2oe31LeaveExitRequestHandlingSectionEv",
+    "ACNH 的退出请求保护区段；宿主无 applet 服务，接管为空操作",
+    void, h_oe_LeaveExitRequest, void) {
+}
 
 // 脚本化状态变化（无窗口验证生命周期 / 过热降级）：DM_OE_SCRIPT="focus=3@10,focus=1@20,opmode=0@30"（第 N 秒）
 // 时刻从游戏第一次取通知算起；「@ingame+N」= 读取画面第 K 次撤下（K = 前面 @ingame 项数 + 1，首个即进局）后 N 秒（按事件，不受负载影响）。与前端调用并存。

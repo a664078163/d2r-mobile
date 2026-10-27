@@ -1,0 +1,91 @@
+name: DmACNH
+options:
+  bundleIdPrefix: ${DM_BUNDLE_ID}
+  deploymentTarget:
+    iOS: "26.0"
+configFiles:
+  Release: Gen/dm.xcconfig
+  Debug: Gen/dm.xcconfig
+targets:
+  DmIOS:
+    type: application
+    platform: iOS
+    sources:
+      - Sources/main.m
+      - Sources/front_ios.m
+      - Sources/dm_gamepad.m
+      - Sources/DmTouchOverlay.m
+      - Sources/dm_touch_controls.c
+      - Sources/dm_touch_game_bridge.c
+      - Sources/dm_touch_game_identity.c
+      - Sources/dm_touch_game_state.c
+      - Sources/dm_touch_native_art.c
+      - Sources/asset_dl.m
+      - Sources/dm_rift_hud.m
+      - Sources/dm_sharelog.m
+      - Sources/dm_metal_cache_guard.c
+      - Sources/dm_pack.c
+      - Sources/bootprof_ios.m
+      - Sources/mallocdiag_ios.m
+      - Sources/cloud_ios.m
+      - Assets.xcassets
+      - path: Gen/dm
+        type: folder
+        buildPhase: resources
+      - path: Gen/msl
+        type: folder
+        buildPhase: resources
+      - path: Gen/embed.S
+      - path: Gen/src
+      - path: Gen/main/main.c
+        compilerFlags: "-Dmain=dm_main"
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Animal Crossing Mobile
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        UILaunchStoryboardName: ""
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationLandscapeLeft
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIViewControllerBasedStatusBarAppearance: false
+        LSApplicationCategoryType: public.app-category.simulation-games
+        LSSupportsGameMode: true
+        ITSAppUsesNonExemptEncryption: false
+        CADisableMinimumFrameDurationOnPhone: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default
+                UISceneDelegateClassName: SceneDelegate
+    dependencies:
+      - sdk: BackgroundAssets.framework
+      - sdk: Network.framework
+      - sdk: libcompression.tbd
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: ${DM_BUNDLE_ID}
+      ENABLE_USER_SCRIPT_SANDBOXING: NO
+      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      MARKETING_VERSION: "1.0"
+      CURRENT_PROJECT_VERSION: $(DM_BUILD_NUMBER)
+      DM_BUILD_NUMBER: "1"
+      DEVELOPMENT_TEAM: ${DM_TEAM_ID}
+      CODE_SIGN_STYLE: Automatic
+      TARGETED_DEVICE_FAMILY: $(DM_DEVICE_FAMILY)
+      DM_DEVICE_FAMILY: "1,2"
+      ENABLE_BITCODE: NO
+      GCC_C_LANGUAGE_STANDARD: gnu11
+      OTHER_CFLAGS: $(inherited) -mcpu=apple-a18 -DDM_IOS_GAME_ACNH=1
+      CLANG_ENABLE_OBJC_ARC: YES
+      DEBUG_INFORMATION_FORMAT: dwarf
+schemes:
+  DmIOS:
+    build:
+      targets:
+        DmIOS: all

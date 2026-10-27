@@ -8,6 +8,14 @@ static struct { uint32_t magic; } g_display = {0x50534944}, g_layer = {0x5259414
 static struct { uint32_t magic; void *layer; } g_native = {0x4e49574e, 0};
 
 HLE_FORCE("_ZN2nn2vi10InitializeEv", "显示服务初始化；宿主无 vi 服务", void, h_vi_Init, void) {}
+HLE_FORCE_PROFILE(HLE_GAME_ACNH,
+    "_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE",
+    "ACNH 的 vi 服务对象不在宿主进程；直接给客体绑定宿主内核事件",
+    Result, h_vi_GetVsyncEvent, void *out, void *display) {
+    (void)display;
+    hle_bind_system_event(out, 1);
+    return RES_OK;
+}
 HLE_FORCE("_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", "开默认显示；宿主给静态对象", Result, h_vi_OpenDisp, void **out) {
     *out = &g_display; return RES_OK;
 }

@@ -60,11 +60,18 @@
 #include "dm_input.h"
 #include "dm_padmap.h"
 #include "hle.h"
+#include "../../host/dm_game.h"
 
 static void (*g_on_mode)(int pad);
 static int g_pad_mode, g_need_center;
 void dm_padmode_request(int pad);   // 宿主 dm_padmode.c：布局换成原版手柄版 / 触屏版 | Host dm_padmode.c: switch the layouts to the original controller version / the touch version
-static void set_mode(int pad) { if (g_pad_mode == pad) return; g_pad_mode = pad; dm_padmode_request(pad); LOG("手柄：%s", pad ? "手柄有输入 → 手柄模式" : "碰了屏幕 / 手柄断开 → 触屏模式"); if (g_on_mode) g_on_mode(pad); }
+static void set_mode(int pad) {
+    if (g_pad_mode == pad) return;
+    g_pad_mode = pad;
+    if (dm_game_is_d2r()) dm_padmode_request(pad);
+    LOG("手柄：%s", pad ? "手柄有输入 → 手柄模式" : "碰了屏幕 / 手柄断开 → 触屏模式");
+    if (g_on_mode) g_on_mode(pad);
+}
 int dm_gamepad_mode(void) { return g_pad_mode; }
 
 // 各手柄各存各的（槽 0、1 留给触点脚本的两个虚拟手柄，其余给实体手柄）
@@ -102,7 +109,7 @@ static void apply(void) {
     // (attached by the host on joining a run, dm_freetp.c); that one goes through the original game's own cast and does not pass through here.
     // Taken over only in game state: with a panel open ZR goes to the original game as usual (the stash / Chronicle use ZL / ZR to switch tabs);
     // a press that was taken over in game state is not handed to the game until it is released
-    { static uint64_t prev; static int mine; void dm_tp_request(void); int dm_front_navigation(void), dm_freetp_zr_free(int zl);
+    if (dm_game_is_d2r()) { static uint64_t prev; static int mine; void dm_tp_request(void); int dm_front_navigation(void), dm_freetp_zr_free(int zl);
       if ((b & DM_BTN_ZR) && !(prev & DM_BTN_ZR)) { mine = !dm_front_navigation() && dm_freetp_zr_free((b & DM_BTN_ZL) != 0); if (mine) { dm_tp_request(); LOG("手柄：ZR（这一格空着）→ 免费回城"); } }
       prev = b; if (mine) b &= ~(uint64_t)DM_BTN_ZR; if (!(b & DM_BTN_ZR) && !(prev & DM_BTN_ZR)) mine = 0; }
     dm_pad_set(b, ax[0], ax[1], ax[2], ax[3]);

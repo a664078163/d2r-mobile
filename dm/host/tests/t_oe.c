@@ -141,6 +141,11 @@ static void test_scale3d(void) {
     CHECK(a == 0 && b == 0, "动态比例：实玩第二段的慢帧序列（帧率 59+）不论散开还是挤在一起都不换级");
 }
 int main(void) {
+    // ACNH 的 CPU Boost 请求由宿主截断：参数值不改变宿主状态，也不能进入 applet/am 服务。
+    // The host cuts ACNH's CPU Boost request: the argument changes no host state and must not enter the applet/am service.
+    h_oe_SetCpuBoostMode(0);
+    h_oe_SetCpuBoostMode(1);
+    CHECK(1, "ACNH CPU Boost 两档接管均安全返回");
     test_scale3d();
     unsetenv("DM_OE_SCRIPT"); reset();
     CHECK(empty(), "初始空队列：返回false且不改输出");

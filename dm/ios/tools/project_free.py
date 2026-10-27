@@ -15,6 +15,11 @@
 # The number of places removed in each category is checked, and on a mismatch it reports an error and produces no file (so that nothing is silently left unremoved when the project description changes format).
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
+profile = sys.argv[3:4][0] if len(sys.argv) > 2 else ''
+# ACNH and D3 are local-resource shells: neither project description carries
+# the D2R hosted-asset extension or the entitlements removed for a paid build.
+# Keep the historical "acnh" switch and make the same contract explicit for D3.
+local_resource_profile = profile in ('acnh', 'd3')
 L = open(src, encoding='utf-8').read().split('\n')
 ENT = re.compile(r'^ *com\.apple\.developer\.(kernel\.increased-memory-limit|kernel\.extended-virtual-addressing|sustained-execution|icloud-container-identifiers|icloud-services|ubiquity-container-identifiers):')
 BA = re.compile(r'^ *(BAAppGroupID|BAHasManagedAssetPacks|BAUsesAppleHosting):')
@@ -29,6 +34,7 @@ while i < len(L):
         while i < len(L) and not re.match(r'^  \S', L[i]) and not re.match(r'^\S', L[i]): i += 1
         continue
     out.append(l); i += 1
-if (n_ent, n_ba, n_dep, n_tgt) != (6, 3, 1, 1): sys.exit('project_free.py：该去掉的东西数目不对（权限 %d / 6、托管资源包键 %d / 3、依赖 %d / 1、扩展目标 %d / 1）——工程描述的写法变了，先改这个脚本' % (n_ent, n_ba, n_dep, n_tgt))
+want = (0, 0, 0, 0) if local_resource_profile else (6, 3, 1, 1)   # ACNH/D3 工程没有免费档签不了的权限，也不带托管资源包
+if (n_ent, n_ba, n_dep, n_tgt) != want: sys.exit('project_free.py：该去掉的东西数目不对（权限 %d / %d、托管资源包键 %d / 3、依赖 %d / 1、扩展目标 %d / 1）——工程描述的写法变了，先改这个脚本' % (n_ent, want[0], n_ba, n_dep, n_tgt))
 if any('RomfsDownloader' in l and not l.lstrip().startswith('#') for l in out): sys.exit('project_free.py：去掉之后工程描述里还有 RomfsDownloader')
 open(dst, 'w', encoding='utf-8').write('\n'.join(out))

@@ -8,12 +8,19 @@
 #include <sys/xattr.h>
 #include <errno.h>
 static int fail_name_write;
+static int guest_xattr_reads;
+static ssize_t fake_getxattr(const char *p, const char *name, void *v, size_t n, u_int32_t pos, int opt) {
+    guest_xattr_reads++;
+    return getxattr(p, name, v, n, pos, opt);
+}
 static int fake_setxattr(const char *p, const char *name, const void *v, size_t n, u_int32_t pos, int opt) {
     if (fail_name_write) { errno = ENOSPC; return -1; }
     return setxattr(p, name, v, n, pos, opt);
 }
+#define getxattr fake_getxattr
 #define setxattr fake_setxattr
 #include HLE_FS_SOURCE
+#undef getxattr
 #undef setxattr
 struct dm_flags g_flag; uint64_t g_t0_ns;
 uint64_t now_ns(void) { return 0; }
@@ -45,14 +52,25 @@ static int entry_count(void) {
 static void *create_race(void *p) { return (void *)(uintptr_t)h_fs_CreateFile(p, 0); }
 int dm_custom_lang_explicit(void) { return -1; }   // 语言开关（dm_custom.c）：这份单测不涉及，当作玩家没点过 | Language switch (dm_custom.c): not involved in this unit test, treated as the player never having tapped it
 int main(void) {
-    char root[1024], save[1024], p[1100];
+    char root[1024], save[1024], p[1100], model[1100], item[1200];
     const char *tmp = getenv("TMPDIR");
     if (tmp) snprintf(root, sizeof root, "%s/case.XXXXXX", tmp);
     else snprintf(root, sizeof root, "%s%s/run/platform/case.XXXXXX", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work");
     if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
     snprintf(save, sizeof save, "%s/save", root); mkdir(save, 0755);
     snprintf(p, sizeof p, "%s/Legacy", save); FILE *f = fopen(p, "w"); fputs("old", f); fclose(f);
+    snprintf(model, sizeof model, "%s/Model", save); mkdir(model, 0755);
+    for (int i = 0; i < 4096; i++) {
+        snprintf(item, sizeof item, "%s/Asset-%04d.bin", model, i);
+        f = fopen(item, "w"); if (!f) { perror("fopen"); return 2; }
+        fputs("asset", f); fclose(f);
+    }
+    snprintf(item, sizeof item, "%s/Target.bin", model);
+    f = fopen(item, "w"); fputs("target", f); fclose(f);
     setenv("DM_SAVE", save, 1); CHECK(h_fs_MountSave("save", NULL) == RES_OK, "挂载原有存档");
+    guest_xattr_reads = 0;
+    CHECK(content("save:/Model/Target.bin", "target"), "大量同级文件下精确打开目标文件");
+    CHECK(guest_xattr_reads < 8, "精确名称命中不扫描整个目录");
     uint64_t h = 0; int32_t type = -1;
     CHECK(content("save:/Legacy", "old"), "原有大小写名字可读");
     Result r = h_fs_OpenFile(&h, "save:/legacy", 1); if (!r) h_fs_CloseFile(h);

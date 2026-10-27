@@ -43,6 +43,7 @@ SRC=\
 	dm_potpick.c \
 	dm_pouch.c \
 	dm_cloudmerge.c \
+	dm_game.c \
 	dm_rift.c \
 	dm_rift_ui.c \
 	dm_runeword.c \
@@ -72,7 +73,8 @@ SRC=\
 GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m))
 GFX_H=$(sort $(wildcard ../gfx/nvn/*.h ../gfx/nvn/include/*.h ../gfx/tex/*.h))
 # 第三方：libdeflate 只编解压相关源（TACT BLTE zlib 块，hle_tact.c）
-# Third party: only the decompression-related sources of libdeflate are built (TACT BLTE zlib blocks, hle_tact.c)
+# Third party: only the decompression-related sources of libdeflate are built
+# (TACT BLTE zlib blocks, hle_tact.c)
 LIBDEFLATE=../third_party/libdeflate/lib/deflate_decompress.c ../third_party/libdeflate/lib/zlib_decompress.c ../third_party/libdeflate/lib/adler32.c ../third_party/libdeflate/lib/utils.c ../third_party/libdeflate/lib/arm/cpu_features.c
 .DEFAULT_GOAL := dmhost   # 下面先写了表头生成规则，缺省目标要明说（否则 make 只生成表头、不编宿主） | The header generation rules are written first below, so the default goal must be stated explicitly (otherwise make only generates the headers and does not build the host)
 print-macos-min:

@@ -3,6 +3,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "../nvn/include/nvn.h"
 #include "../nvn/nvn_tex.h"
 
 // 把第 level 级、第 layer 层（数组 / 立方体的层；非分层贴图取 0）从整张贴图存储 src_storage 解到线性 dst_linear。
@@ -24,3 +25,12 @@ uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, u
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices,
                        uint64_t *base, unsigned *tileH, unsigned *tileD, uint32_t *bpb);
+
+// 把 NVN TextureWriteTexels 的一个区域写入整张贴图存储。layer 是 view 的起始层；
+// 数组贴图的 zoffset/depth 表示连续层，3D 贴图则表示体内 z 范围。支持块线性与 LINEAR。
+// Write one NVN TextureWriteTexels region into whole-texture storage. `layer` is the
+// view's first layer; for array textures zoffset/depth select consecutive layers, while
+// for 3D textures they select a volume range. Supports block-linear and LINEAR storage.
+int nvn_write_texels(const nvn_texdesc *d, unsigned level, unsigned layer,
+                     const NVNcopyRegion *r, const void *src,
+                     size_t row_stride, size_t image_stride, void *dst_storage);

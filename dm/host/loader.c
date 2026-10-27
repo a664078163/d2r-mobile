@@ -11,6 +11,7 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include "hle.h"
+#include "dm_game.h"
 
 module_t g_mod[MAX_MOD];
 int g_nmod;
@@ -134,6 +135,8 @@ static void force_init(void) {
 static void *force_lookup(const char *name) {
     for (unsigned i = 0; i < g_nforce; i++)
         if (!strcmp(g_force[i].name, name)) {
+            unsigned game = dm_game_is_acnh() ? HLE_GAME_ACNH : dm_game_is_d3() ? HLE_GAME_D3 : HLE_GAME_D2R;
+            if (g_force[i].game_mask && !(g_force[i].game_mask & game)) return NULL;
             if (!g_force_hits[i]++ && g_flag.imports) LOG("force %s  （%s）", name, g_force[i].why);
             void *hlecount_wrap(const char *, const char *, void *); return hlecount_wrap("FORCE", name, g_force[i].fn);   // DM_HLECOUNT 时为计数桩 | A counting stub when DM_HLECOUNT is set
         }
@@ -141,10 +144,23 @@ static void *force_lookup(const char *name) {
 }
 static void force_check(void) {
     int bad = 0;
-    for (unsigned i = 0; i < g_nforce; i++)
-        if (!g_force_hits[i]) { LOG("强制接管条目无任何引用：%s", g_force[i].name); bad = 1; }
+    for (unsigned i = 0; i < g_nforce; i++) {
+        unsigned game = dm_game_is_acnh() ? HLE_GAME_ACNH : dm_game_is_d3() ? HLE_GAME_D3 : HLE_GAME_D2R;
+        // The legacy unmasked table is a strict D2R contract.  New profiles
+        // only make entries mandatory when they opt in with an explicit mask;
+        // otherwise an unreferenced D2R service is diagnostic, not fatal.
+        int required = dm_game_is_d2r()
+            ? (!g_force[i].game_mask || (g_force[i].game_mask & game))
+            : (g_force[i].game_mask && (g_force[i].game_mask & game));
+        if (!g_force_hits[i] && required) {
+            LOG("强制接管条目无任何引用：%s", g_force[i].name);
+            bad = 1;
+        }
+    }
     if (bad) die("强制接管清单有误");
-    LOG("force: %u 条全部命中", g_nforce);
+    if (dm_game_is_acnh()) LOG("force: %u 条中被 Animal Crossing 引用的条目已接管；未引用的其他游戏条目仅作诊断", g_nforce);
+    else if (dm_game_is_d3()) LOG("force: %u 条中被 Diablo III 引用的条目已接管；未引用的其他游戏条目仅作诊断", g_nforce);
+    else LOG("force: %u 条全部命中", g_nforce);
 }
 
 // 读改写器表头（段边界、槽号）；表头以外有任何行即旧版产物（装载期改代码），拒绝
@@ -200,14 +216,36 @@ static void register_gates(module_t *m, const char *dir) {
 }
 
 static void relocate(module_t *m) {
-    uint64_t rela = 0, relasz = 0, jmprel = 0, pltsz = 0;
+    uint64_t rela = 0, relasz = 0, jmprel = 0, pltsz = 0, relr = 0, relrsz = 0, relrent = 0;
     for (const Elf64_Dyn *d = m->dyn; d->d_tag; d++) switch (d->d_tag) {
         case DT_RELA: rela = d->d_un.d_ptr; break;
         case DT_RELASZ: relasz = d->d_un.d_val; break;
         case DT_JMPREL: jmprel = d->d_un.d_ptr; break;
         case DT_PLTRELSZ: pltsz = d->d_un.d_val; break;
+        case DT_RELR: relr = d->d_un.d_ptr; break;
+        case DT_RELRSZ: relrsz = d->d_un.d_val; break;
+        case DT_RELRENT: relrent = d->d_un.d_val; break;
     }
-    int cnt[3] = {0};
+    int cnt[4] = {0};
+    if (relrsz && relrent != sizeof(uint64_t)) die("%s: DT_RELRENT=%llu，不是 8 字节", m->name, (unsigned long long)relrent);
+    uint64_t cursor = 0;
+    for (uint64_t i = 0; i < relrsz / sizeof(uint64_t); i++) {
+        uint64_t entry = *(const uint64_t *)(m->base + relr + i * sizeof(uint64_t));
+        if (!(entry & 1)) {
+            cursor = entry;
+            if (cursor + sizeof(uint64_t) > m->size) die("%s: DT_RELR 目标越界 %#llx", m->name, (unsigned long long)cursor);
+            *(uint64_t *)(m->base + cursor) += (uint64_t)(uintptr_t)m->base;
+            cursor += sizeof(uint64_t);
+            cnt[3]++;
+        } else {
+            for (unsigned bit = 1; bit < 64; bit++, cursor += sizeof(uint64_t)) {
+                if (!(entry & (1ull << bit))) continue;
+                if (cursor + sizeof(uint64_t) > m->size) die("%s: DT_RELR bitmap 目标越界 %#llx", m->name, (unsigned long long)cursor);
+                *(uint64_t *)(m->base + cursor) += (uint64_t)(uintptr_t)m->base;
+                cnt[3]++;
+            }
+        }
+    }
     const Elf64_Rela *tabs[2] = {(const Elf64_Rela *)(m->base + rela), (const Elf64_Rela *)(m->base + jmprel)};
     uint64_t sizes[2] = {relasz, pltsz};
     for (int t = 0; t < 2; t++)
@@ -222,7 +260,7 @@ static void relocate(module_t *m) {
             if (type == R_AARCH64_JUMP_SLOT) { *where = v; cnt[2]++; }
             else { *where = v + r->r_addend; cnt[1]++; }       // ABS64 / GLOB_DAT
         }
-    LOG("%s: reloc relative=%d abs/glob=%d jump=%d", m->name, cnt[0], cnt[1], cnt[2]);
+    LOG("%s: reloc relative=%d abs/glob=%d jump=%d relr=%d", m->name, cnt[0], cnt[1], cnt[2], cnt[3]);
 }
 
 // DM_LOADHASH=1（诊断）：装载完逐模块出地址无关 sha256，证「提前起跑 / 不提前」装载结果逐字节相同。
@@ -344,7 +382,8 @@ static void map_image(module_t *m, const char *dir) {
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
-    memcpy(m->base, raw, sz); free(raw); install_key_page(m);
+    memcpy(m->base, raw, sz); free(raw);
+    install_key_page(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;

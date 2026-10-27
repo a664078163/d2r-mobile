@@ -23,10 +23,11 @@ TT = {'texture1d': '1d', 'texture1darray': '1darray', 'texture2d': '2d', 'textur
       'texture2dmsarray': '2dmsarray', 'texture3d': '3d', 'texturecube': 'cube', 'texturecubearray': 'cubearray', 'buffer_typed': 'buffer'}
 CT = {'float': 'float', 'int': 'sint', 'uint': 'uint'}
 
-def load():
+def load(path=None):
     """键 → 事实字典；表不存在返回空字典 | key → fact dict; returns an empty dict if the table does not exist"""
-    if not os.path.exists(TABLE): return {}
-    return {k: json.loads(v) for k, v in (l.rstrip('\n').split('\t', 1) for l in open(TABLE) if l.strip() and not l.startswith('#'))}
+    path = path or TABLE
+    if not os.path.exists(path): return {}
+    return {k: json.loads(v) for k, v in (l.rstrip('\n').split('\t', 1) for l in open(path) if l.strip() and not l.startswith('#'))}
 
 def row(key, facts): return key + '\t' + json.dumps(facts, sort_keys=True, separators=(',', ':'), ensure_ascii=False) + '\n'
 

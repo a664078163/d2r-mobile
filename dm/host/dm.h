@@ -18,7 +18,7 @@ typedef struct { uint8_t *d; size_t n; } dm_blob;   // 整份读进内存的一�
 #define ELF64_R_SYM(i) ((i) >> 32)
 #define ELF64_R_TYPE(i) ((i) & 0xffffffff)
 enum { DT_INIT = 12, DT_RELA = 7, DT_RELASZ = 8, DT_JMPREL = 23, DT_PLTRELSZ = 2, DT_SYMTAB = 6, DT_STRTAB = 5,
-       DT_INIT_ARRAY = 25, DT_INIT_ARRAYSZ = 27 };
+       DT_INIT_ARRAY = 25, DT_INIT_ARRAYSZ = 27, DT_RELRSZ = 35, DT_RELR = 36, DT_RELRENT = 37 };
 enum { R_AARCH64_ABS64 = 257, R_AARCH64_GLOB_DAT = 1025, R_AARCH64_JUMP_SLOT = 1026, R_AARCH64_RELATIVE = 1027 };
 
 // 一个 NSO 模块的运行时状态
@@ -81,7 +81,7 @@ void crash_dump_now(const char *why);   // 按需导出现场（线程 + 图形�
 // 诊断开关：main 启动时从环境变量读一次（getenv 要拿 libc 全局环境锁，进热路径会让全部客体线程排队）
 // Diagnostic switches: read once from environment variables when main starts (getenv takes the libc global environment lock, and on a hot path it would make all guest threads queue up)
 extern uint64_t g_t0_ns;   // 宿主启动时刻（now_ns），日志相对时间用 | Host start time (now_ns), used for relative times in the log
-extern struct dm_flags { int thr, svc, fs, movie, dbg, imports, bootprof; } g_flag;
+extern struct dm_flags { int thr, svc, fs, movie, dbg, imports, bootprof, svc_trace; } g_flag;
 // 启动时间线（DM_BOOTPROF=1，diag.c）：分段打点 + 计数器（纳秒 / 字节，全线程累加）；可用 PROF_GFX_* 埋点
 // Boot timeline (DM_BOOTPROF=1, diag.c): segment marks + counters (nanoseconds / bytes, accumulated over all threads); PROF_GFX_* can be used for instrumentation
 enum { PROF_FS_READ, PROF_WAIT_LOCK, PROF_WAIT_CV, PROF_WAIT_ADDR, PROF_WAIT_SYNC, PROF_SLEEP, PROF_MAIN_WAIT,
@@ -92,6 +92,10 @@ uint64_t dm_prof_ribbon_ns(void);   // 第一次出现 OpenPanel MainMenuButtonR
 void *objmap_get(const void *guest); void objmap_put(const void *guest, void *host); void *objmap_del(const void *guest);
 void hle_signal_system_event(void *g);   // hle_thread.c：触发服务层 SystemEvent（任何线程） | hle_thread.c: signal a service-layer SystemEvent (any thread)
 void hle_bind_system_event(void *g, int autoclear);   // 客体线程上把客体 SystemEvent 绑到内核事件 | On a guest thread, bind a guest SystemEvent to a kernel event
+uint32_t dm_service_event_create(int signaled, uint32_t *write_handle);   // 服务层返回一个可等待的读端；写端由宿主持有 | Create a waitable service event; the host keeps the write end
+void dm_service_event_signal(uint32_t write_handle);   // 服务线程触发事件并唤醒客体等待者 | Signal a service event and wake guest waiters
+uint32_t dm_acnh_audren_event_handle(void);   // ACNH audren:u / renderer 共用的 SystemEvent 读端 | Shared ACNH audren:u / renderer SystemEvent read handle
+void dm_acnh_audren_event_signal(void);   // ACNH 无声 renderer 在 Start / Execute 后触发事件 | Signal the ACNH silent renderer event after Start / Execute
 // 缺页钩子 / 宿主写客体内存前钩子（crash.c；写保护脏页跟踪用）
 // Page fault hook / hook before the host writes guest memory (crash.c; used for write-protect dirty page tracking)
 void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc));

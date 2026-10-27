@@ -12,6 +12,7 @@
 // Struct layout follows the public Horizon ABI: DirectoryEntry = {char name[0x301], pad[3], s8 type, pad[3], s64 size} (0x310 bytes).
 #include "hle.h"
 #include "front.h"
+#include "dm_game.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -146,15 +147,36 @@ static int guest_name(const char *parent, const char *physical, char *out, size_
     if (errno != ENOATTR) return 0;
     strlcpy(out, physical, n); return 1;
 }
+// APFS 的精确物理名可以直接命中，不必为每个普通文件读取一次 xattr。
+// realpath 的 basename 保留目录项的实际大小写：只有它与客体名一致时才允许快速命中；
+// 大小写冲突、别名或 realpath 失败一律回到下面的完整目录扫描，维持 Horizon 的精确匹配语义。
+// An exact APFS physical name can be resolved directly without reading one xattr per sibling.
+// realpath preserves the directory entry's actual casing in its basename: fast-path only when
+// that basename equals the guest name; case collisions, aliases, or realpath failures fall back
+// to the full scan below so Horizon's exact-match semantics remain unchanged.
+static int exact_path_component(const char *parent, const char *name, char *physical, size_t n) {
+    char p[2048], resolved[2048], guest[0x301];
+    int len = snprintf(p, sizeof p, "%s/%s", parent, name);
+    if (len < 0 || (size_t)len >= sizeof p) { errno = ENAMETOOLONG; return 0; }
+    struct stat st; if (lstat(p, &st)) return 0;
+    if (!realpath(p, resolved)) return 0;
+    const char *actual = strrchr(resolved, '/');
+    if (!actual || strcmp(actual + 1, name)) return 0;
+    if (!guest_name(parent, actual + 1, guest, sizeof guest) || strcmp(guest, name)) return 0;
+    if (strlen(actual + 1) >= n) { errno = ENAMETOOLONG; return 0; }
+    strlcpy(physical, actual + 1, n); return 1;
+}
 static int path_component(char *parent, size_t n, const char *name, int create) {
-    DIR *d = opendir(parent); if (!d) return 0;
     struct dirent *e; char physical[0x301] = "", guest[0x301];
-    while ((e = readdir(d))) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        if (!guest_name(parent, e->d_name, guest, sizeof guest)) { closedir(d); return 0; }
-        if (!strcmp(guest, name)) { strlcpy(physical, e->d_name, sizeof physical); break; }
+    if (!exact_path_component(parent, name, physical, sizeof physical)) {
+        DIR *d = opendir(parent); if (!d) return 0;
+        while ((e = readdir(d))) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            if (!guest_name(parent, e->d_name, guest, sizeof guest)) { closedir(d); return 0; }
+            if (!strcmp(guest, name)) { strlcpy(physical, e->d_name, sizeof physical); break; }
+        }
+        closedir(d);
     }
-    closedir(d);
     if (!physical[0]) {
         if (!create) { errno = ENOENT; return 0; }
         strlcpy(physical, name, sizeof physical);
@@ -412,14 +434,21 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv；存档 �
     const char *d = getenv("DM_SAVE");
     if (!d) die("未设 DM_SAVE：请指向一份存档目录的可写副本");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // 去掉结尾斜杠（.work / .new 拼在同级） | strip trailing slashes (.work / .new are appended at the same level)
-    stash_seed(dd);
-    low_vision_off(dd);
-    settings_seed(dd); settings_lang_apply(dd);
+    if (dm_game_is_d2r()) {
+        stash_seed(dd);
+        low_vision_off(dd);
+        settings_seed(dd);
+        settings_lang_apply(dd);
+    }
     // 掉落过滤的规则文件（原版启动时载入，dm_lootfilter.c 用构造函数登记这个钩子；只链 hle_fs.c 的单测里它是空的）。与 settings_seed 同一个开关：
     // iOS 上缺省写；Mac 宿主的对拍闸门（存档要和真机真值逐文件相同）不写
     // Rule files for the loot filter (the game loads them at startup; dm_lootfilter.c registers this hook from a constructor; it is null in unit tests that link only hle_fs.c). Same switch as settings_seed:
     // written by default on iOS; not written under the Mac host's parity gate (saves must match the device ground truth file by file)
-    { const char *e = getenv("DM_TOUCH_DEFAULTS"); if (g_dm_mount_seed_hook && (e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE)) g_dm_mount_seed_hook(dd); }
+    if (dm_game_is_d2r()) {
+        const char *e = getenv("DM_TOUCH_DEFAULTS");
+        if (g_dm_mount_seed_hook && (e ? strcmp(e, "0") != 0 : TARGET_OS_IPHONE))
+            g_dm_mount_seed_hook(dd);
+    }
     return mount_ex(name, dd, 0, 1);
 }
 void (*g_dm_pre_commit_hook[5])(const char *workdir);   // 提交前调（工作目录）：宿主旁路文件按工作目录里的存档内容核对后再写（[0] 个人仓库多页 dm_pages.c、[2] 百宝囊 dm_pouch.c、[1] 编年史仓库 dm_vault.c、[3] 秘境进度 dm_rift.c、[4] iCloud 收件箱并回 dm_cloudmerge.c） | Called before commit (working directory): host side files are checked against the save content in the working directory before being written ([0] personal stash multi-page dm_pages.c, [2] pouch dm_pouch.c, [1] Chronicle stash dm_vault.c, [3] Rift progress dm_rift.c, [4] iCloud inbox merge dm_cloudmerge.c)
@@ -590,6 +619,20 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         pthread_mutex_unlock(&m);
     }
     return RES_OK;
+}
+
+/*
+ * ACNH's SDK keeps the FileAccessor layer in the client module.  Its public
+ * ReadFile wrapper forwards to this method instead of crossing the forced
+ * ReadFile symbol again.  The host FileHandle is intentionally an fd, so the
+ * internal method must be forced to the same host read implementation before
+ * the fd is treated as a guest FileAccessor pointer.
+ */
+HLE_FORCE("_ZN2nn2fs6detail12FileAccessor4ReadEPmlPvmRKNS0_10ReadOptionE",
+          "ACNH SDK FileAccessor → same host pread(2) implementation",
+          Result, h_fs_FileAccessorRead, uint64_t h, size_t *out, int64_t off,
+          void *buf, size_t sz, const void *opt) {
+    return h_fs_ReadFile(out, h, off, buf, sz);
 }
 HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp-srv → pwrite(2)", Result, h_fs_WriteFile, uint64_t h, int64_t off, const void *buf, size_t sz, const void *opt) {
     if (!h) return RES_FAIL;

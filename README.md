@@ -1,6 +1,6 @@
 # D2R Mobile
 
-最后更新：2026-10-16
+最后更新：2026-10-27
 
 **An open-source iOS / macOS compatibility layer for Diablo II: Resurrected with the Reign of the Warlock expansion.** It brings the Nintendo Switch release you bought, expansion included, to iPhone, iPad and Mac in full: the original game code runs natively, every control is rebuilt for touch, the frame rate holds at 60 fps, and you are in a game one second after the main menu. There is now a native macOS version as well (first version): on an Apple silicon Mac it starts on double-click and works with keyboard, mouse and gamepad. Apple TV 4K (3rd generation, A15) has a community port (developer preview) that has reached the character-selection screen only on its author's device; see the device table below.
 
@@ -188,6 +188,33 @@ flowchart LR
 | Graphics | `dm/gfx` | Implements the game's graphics API on Metal; shaders are translated offline from the game's originals |
 | iOS app | `dm/ios` | The app shell, touch controls and interface |
 | Verification | `dm/verify` | Checks that the rewritten code behaves exactly like the original, plus the regression gates every change goes through |
+
+## Experimental Animal Crossing adaptation
+
+The repository now has an experimental `acnh` game profile for Animal Crossing: New Horizons. It reuses the D2R host chain—NSO loading and relocation, SDK startup, RomFS, Horizon services, NVN and the Metal renderer—and keeps game-specific service behavior behind the profile boundary. The update `ExeFS` and `RomFS` are prepared at `/Users/haifliu/dm-work/ACNH/Update`; the RomFS is about 9.9 GB. The base RomFS is now exported at `/Users/haifliu/dm-work/ACNH/Base/RomFS` from the NSP ticket-derived title key and is about 6.3 GB.
+
+| Capability | Entry | Current result |
+|---|---|---|
+| ACNH ExeFS startup probe | `DM_GAME_PROFILE=acnh DM_ROMFS=/Users/haifliu/dm-work/ACNH/Update/RomFS ./dm/host/dmhost /private/tmp/acnh-probe main sdk subsdk0` | Passes `DT_RELR`, SDK/init-array startup, `sm:`, CMIF, the NVN bootstrap and Prepare Thread construction; ACNH reports NVN API major 55 through its profile |
+| ACNH iOS shell build | `cd dm/ios && PATH="$PWD/../../.venv/bin:$PATH" DM_IOS_GAME=acnh DM_BUNDLE_ID=com.haifliu.d2rmobile.acnh DM_NO_SIGN=1 DM_MSL_IOS=/Users/haifliu/dm-work/acnh-ios-msl bash run.sh build` | Release compilation and linking pass; `main`, `sdk` and `subsdk0` are embedded as three image sets. The package carries 3,480 ACNH MSL-backed libraries and reflections under the existing no-Metal-toolchain shell path; the free-account branch remains available |
+| ACNH resource preparation | Use the base NSP and update NSP from `/Users/haifliu/dm-work/dongsen`; derive title keys from the NSP tickets with the existing local `nsz`/`hactool` path, then layer the update BKTR RomFS over the base RomFS | Base RomFS is exported and anchored at `/Users/haifliu/dm-work/ACNH/Base/RomFS` (about 6.3 GB); Update RomFS is complete (about 9.9 GB) |
+| ACNH resource transfer | `.venv/bin/python dm/tools/acnh_pack.py inspect /Users/haifliu/dm-work/acnh-packs/update-chunks/update-000.dmp` | Existing persistent Update (10 packs) and Base (7 packs) batches all pass inspection under the unified 64 MiB entry limit; iOS chooses a complete pair set and falls back from an incomplete Caches set to Documents. No full resource retransmission is required |
+| ACNH pack import safety | `cd dm/ios/tests && make -B t_dm_pack && ./t_dm_pack` | Verifies pack integrity, path safety, rollback, atomic publication, raw DEFLATE compatibility, and extraction of a multi-megabyte stored entry from a 512 KiB worker stack. The device importer keeps its I/O buffer on the heap so iOS background-thread stack limits cannot terminate the app |
+| Real graphics run | Keep the validated Base + Update RomFS layers at the app's `Application Support/acnh/romfs` and `Application Support/acnh/update`, then run the installed ACNH app only when explicitly requested | Mac smoke now computes ACNH shader keys, preserves ACNH's 16-byte guest texture views, passes the audren boundary, and exits cleanly with no NVN red lines; the latest iOS package still needs rebuilding and ACNH-only installation, so device first-frame verification remains pending |
+
+The ACNH adaptation is not yet a playable product. The shell, resource importer, shader-key contract, and host initialization path are verified; the latest guest-view fix has not yet been rebuilt and installed on the phone, and real-container import plus first gameplay frame remain unverified. Finder's `DeviceFS` cache view was incorrectly treated as proof of completion; use `devicectl` container listings for verification. See [ARCHITECTURE.md](ARCHITECTURE.md) for the shared chain and [PROGRESS.md](PROGRESS.md) for the exact boundary.
+
+## Experimental Diablo III adaptation
+
+The repository now has a separate `d3` profile for Diablo III: Eternal Collection. It reuses the D2R host, loader, Horizon service layer, NVN/Metal replay and physical-controller path, while keeping D2R-only touch UI, cloud-save, overlay and offline patch cuts out of the D3 product.
+
+| Capability | Entry | Current result |
+|---|---|---|
+| D3 NSO product generation | `DM_D3_EXEFS=/path/to/D3/ExeFS PYTHON=$PWD/.venv/bin/python DM_D3_MODULES="main sdk" dm/tools/d3_product.sh /private/tmp/d3-product` | The current D3 Update ExeFS was extracted locally and confirmed to contain `main`/`sdk`; the native ruleset generated profile-safe patched binaries and gate tables. The patcher handles D3's `mov sp, x18` dynamic-stack sites without applying D2R fixed-address cuts or observations |
+| D3 iOS project | `cd dm/ios && DM_LOCAL_ENV=/dev/null DM_TEAM_ID=<team> DM_BUNDLE_ID=<base-id> DM_IOS_GAME=d3 DM_OUT=/private/tmp/d3-product DM_D3_SHADER_MAP=<d3-map> DM_D3_MSL_IOS=<d3-ios-msl> bash run.sh build` | Uses `project_d3.yml`, Bundle ID suffix `.d3`, `DM_GAME_PROFILE=d3`, and the default `main` + `sdk` module set. The build now refuses the D2R shader map/cache; the existing signed arm64 shell at `/Users/haifliu/dm-work/D3/Install/DmD3.app` is retained only as an audit artifact and is not a playable candidate |
+| D3 resource layout | Copy decrypted Base RomFS to `Application Support/d3/romfs` and Update RomFS to `Application Support/d3/update` (or the matching `Documents/d3` paths) | The shell verifies that at least one layer contains files, sets `DM_ROMFS_OVERLAY=update:base` when both exist, and keeps the repair page available until import completes |
+
+D3 now has a real Update ExeFS-backed signed shell, but it is not a playable or install-ready candidate: Base/Update RomFS have not been exported, the packaged iOS shader cache is a temporary shared B-route staging cache, and no D3-specific shader map or first-frame run has been validated. `run.sh` now rejects that fallback explicitly. The remaining work is evidence-driven resource, service and shader compatibility; the D2R and ACNH profiles remain separate.
 
 **Why you can trust it:** the stability is not luck. The test and verification tooling is part of the project — unit tests for the host and graphics layers, an equivalence check for every rewritten instruction, scripted walkthrough regression for the touch interface, and on-device smoke tests. Start with `make -C dm/host/tests run`, `make -C dm/gfx/tests run` and `dm/verify/regress.sh` (run them inside the Python environment prepared in step 2 below; `regress.sh` also needs `brew install llvm`). How to contribute is in [CONTRIBUTING.md](CONTRIBUTING.md).
 

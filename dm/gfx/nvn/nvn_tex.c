@@ -36,6 +36,7 @@ int nvn_fmt_bpb(int f, int *bw, int *bh) { fmt_t t = fmt_of(f); if (bw) *bw = t.
 
 static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
 static uint32_t blk(uint32_t s, uint32_t b) { return (s + b - 1) / b; }
+static uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 static unsigned pick_tile(uint32_t gobs) { return gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0; }
 static unsigned adj_tile(unsigned shift, uint32_t unit, uint32_t dim) {
     if (!shift) return 0;
@@ -63,6 +64,22 @@ static void shape(const nvn_texdesc *d, unsigned *dpl, int *layered, uint32_t *w
 static void samples_xy(int s, uint32_t *sx, uint32_t *sy) {
     *sx = *sy = 1;
     if (s == 2) *sx = 2; else if (s == 4) *sx = *sy = 2; else if (s == 8) { *sx = 4; *sy = 2; }
+}
+
+static uint32_t linear_stride(const nvn_texdesc *d, unsigned level, uint32_t w, fmt_t t) {
+    uint32_t align = (d->flags & 0x40) ? 128 : 32;
+    uint32_t packed = t.bpb * blk(w, t.bw);
+    uint32_t stride = d->stride && level == 0 ? d->stride : packed;
+    if (stride < packed) stride = packed;
+    return align_up(stride, align);
+}
+
+static uint64_t linear_level_size(const nvn_texdesc *d, unsigned level, unsigned dpl,
+                                  uint32_t w, uint32_t h, uint32_t z, fmt_t t) {
+    uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
+    uint32_t rows = dpl >= 2 ? blk(mip(h * sy, level), t.bh) : 1;
+    uint32_t slices = dpl >= 3 ? mip(z, level) : 1;
+    return (uint64_t)linear_stride(d, level, mip(w, level), t) * rows * slices;
 }
 
 static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl, uint32_t w, uint32_t h, uint32_t z,
@@ -93,10 +110,12 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         o->layer_size = o->size = (uint64_t)t.bpb * d->width;
         o->align = t.bpb == 12 ? 4 : t.bpb; return;
     }
-    if (d->flags & 0x10) {                                            // LINEAR：行距 = stride 或按 32 对齐 | LINEAR: row pitch = stride or aligned to 32
+    if (d->flags & 0x10) {                                            // LINEAR：逐级、逐层累计；stride 只指定第 0 级 | LINEAR: accumulate each level and layer; stride specifies level 0 only
         o->align = (d->flags & 0x40) ? 128 : 32;
-        uint32_t stride = d->stride ? d->stride : (t.bpb * blk(w, t.bw) + o->align - 1) & ~(o->align - 1);
-        o->layer_size = o->size = (uint64_t)stride * blk(h, t.bh);
+        o->layer_size = 0;
+        for (unsigned l = 0, n = d->levels ? d->levels : 1; l < n; l++)
+            o->layer_size += linear_level_size(d, l, dpl, w, h, z, t);
+        o->size = o->layer_size * o->layers;
         return;
     }
     unsigned tileH = 0, tileD = 0;
@@ -121,9 +140,25 @@ uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
     fmt_t t = fmt_of(d->format);
     unsigned dpl; int layered; uint32_t w, h, z;
     shape(d, &dpl, &layered, &w, &h, &z);
-    if (!t.bpb || (d->flags & 0x10) || d->target == 10) return 0;
+    if (!t.bpb || d->target == 10) return 0;
+    if (d->flags & 0x10) {
+        unsigned dpl; int layered; uint32_t w, h, z;
+        shape(d, &dpl, &layered, &w, &h, &z); (void)layered;
+        uint64_t off = 0;
+        for (unsigned l = 0; l < level; l++) off += linear_level_size(d, l, dpl, w, h, z, t);
+        return off;
+    }
     nvn_texlayout L; nvn_tex_layout(d, &L);
     return level_offset(d, level, dpl, w, h, z, L.tileH, L.tileD, t);
+}
+
+uint32_t nvn_tex_level_stride(const nvn_texdesc *d, unsigned level) {
+    int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh); (void)bh;
+    if (!bpb) return 0;
+    unsigned dpl; int layered; uint32_t w, h, z;
+    shape(d, &dpl, &layered, &w, &h, &z); (void)layered; (void)h; (void)z;
+    return d->flags & 0x10 ? linear_stride(d, level, mip(w, level), (fmt_t){(uint8_t)bpb, (uint8_t)bw, 1})
+                           : bpb * blk(mip(w, level), (uint32_t)bw);
 }
 
 void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, unsigned *tileD) {

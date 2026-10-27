@@ -193,6 +193,9 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
 static uint32_t *g_slots; static int g_slots_sealed;
 static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn) {
     if (g_nprobe >= MAX_PROBE) die("探针过多");
+    if (off >= m->size || off + sizeof(uint32_t) > m->size)
+        die("DM_PROBE 偏移越界：%s+%#llx（镜像长度 %#llx）", m->name,
+            (unsigned long long)off, (unsigned long long)m->size);
     if (!g_slots) g_slots = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     uint64_t at = (uint64_t)m->base + off;
     uint32_t *w = (uint32_t *)at, *sl = g_slots + g_nprobe * 8;
@@ -461,7 +464,8 @@ void probe_install(void) {
             char *at_ = strchr(c + 1, '@');
             long dump = -1;
             if (at_) dump = at_[1] == '*' ? (0x1000000 | strtol(at_ + 2, 0, 16)) : strtol(at_ + 1, 0, 16);   // @偏移 / @*偏移 | @offset / @*offset
-            probe_add(m, strtoull(c + 1, 0, 16), dump, NULL);
+            uint64_t off = strtoull(c + 1, 0, 16);
+            probe_add(m, off, dump, NULL);
         }
     }
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }

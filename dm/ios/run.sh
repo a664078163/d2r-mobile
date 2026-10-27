@@ -10,13 +10,120 @@ cd "$(dirname "$0")"
 source tools/devlock.sh
 source tools/asc_env.sh
 source tools/local_env.sh   # 本机设备配置（不进仓，见 local.env.example）；出包不需要设备号，装机 / 启动时才核 | Local device configuration (not committed, see local.env.example); packaging does not need a device ID, it is only checked at install / launch
-D=${DM_DEVICE:-}; B=${DM_BUNDLE_ID:?先在本机配置里设 DM_BUNDLE_ID（App 包名，见 dm/ios/local.env.example）}
+GAME=${DM_IOS_GAME:-d2r}
+ROOT=${DM_ROOT:-$HOME/dm-work}
+case "$GAME" in
+  d2r) B=${DM_BUNDLE_ID:?先在本机配置里设 DM_BUNDLE_ID（App 包名，见 dm/ios/local.env.example）}; PROJECT=DmIOS; SPEC_PROJECT=DmIOS ;;
+  acnh)
+    case "${DM_BUNDLE_ID:-}" in
+      *.acnh) B=$DM_BUNDLE_ID ;;
+      '') B=com.d2rmobile.app.acnh ;;
+      *) B=${DM_BUNDLE_ID}.acnh ;;
+    esac
+    PROJECT=DmACNH; SPEC_PROJECT=DmACNH ;;
+  d3)
+    case "${DM_BUNDLE_ID:-}" in
+      *.d3) B=$DM_BUNDLE_ID ;;
+      '') B=com.d2rmobile.app.d3 ;;
+      *) B=${DM_BUNDLE_ID}.d3 ;;
+    esac
+    PROJECT=DmD3; SPEC_PROJECT=DmD3 ;;
+  *) echo "🔴 DM_IOS_GAME 只能是 d2r、acnh 或 d3（当前：$GAME）" >&2; exit 1 ;;
+esac
+export DM_BUNDLE_ID=$B
+D=${DM_DEVICE:-}
 R=${DM_ROOT:-$HOME/dm-work}/run/ios; mkdir -p "$R/out"
-DD=${DM_IOS_DD:-$R/dd}
+DD=${DM_IOS_DD:-$R/dd${GAME:+-$GAME}}
 APP=$DD/Build/Products/Release-iphoneos/DmIOS.app
 t(){ echo "[$(date +%T)] $*"; }
-OUT=${DM_OUT:-$(bash "../tools/product.sh" path touch)}; MODS="main sdk"
+if [ "$GAME" = acnh ] || [ "$GAME" = d3 ]; then
+    OUT=${DM_OUT:-$( [ "$GAME" = acnh ] && echo "$ROOT/acnh-product" || echo "$ROOT/d3-product" )}
+  MODS=${DM_MODULES:-$( [ "$GAME" = acnh ] && echo 'main sdk subsdk0' || echo 'main sdk' )}
+else
+  OUT=${DM_OUT:-$(bash "../tools/product.sh" path touch)}
+  MODS="main sdk"
+fi
 if [ "$1" = build ]; then
+  if [ "$GAME" = acnh ] || [ "$GAME" = d3 ]; then
+    if [ "${DM_IOS_M3:-0}" = 1 ]; then t "🔴 ${GAME} 工程当前只定义 Metal 4 路径，DM_IOS_M3 尚未适配"; exit 1; fi
+    if [ "$GAME" = acnh ]; then
+      SPEC_FILE=project_acnh.yml; GEN_PROJECT=DmACNH; LABEL=ACNH; SHMAP=${DM_ACNH_SHADER_MAP:-../gfx/nvn/shader_map_acnh.tsv}
+    else
+      SPEC_FILE=project_d3.yml; GEN_PROJECT=DmD3; LABEL="Diablo III"; SHMAP=${DM_D3_SHADER_MAP:-}
+      [ -n "$SHMAP" ] || { t "🔴 D3 必须显式提供 DM_D3_SHADER_MAP；禁止回退到 D2R shader_map.tsv"; exit 1; }
+      [ -f "$SHMAP" ] || { t "🔴 D3 shader 映射表不存在：$SHMAP"; exit 1; }
+      if cmp -s "$SHMAP" ../gfx/nvn/shader_map.tsv; then
+        t "🔴 D3 shader 映射表仍是 D2R 版本，拒绝继续构建"; exit 1
+      fi
+    fi
+    if [ "${DM_FREE_ACCOUNT:-0}" = 1 ] && [ "$GAME" = acnh ]; then
+      python3 tools/project_free.py "$SPEC_FILE" project_acnh_free.yml acnh ||
+        { t "🔴 DM_FREE_ACCOUNT：ACNH 免费档工程描述没生成"; exit 1; }
+      ACNH_SPEC=project_acnh_free.yml
+    elif [ "${DM_FREE_ACCOUNT:-0}" = 1 ]; then
+      python3 tools/project_free.py "$SPEC_FILE" project_d3_free.yml d3 ||
+        { t "🔴 DM_FREE_ACCOUNT：Diablo III 免费档工程描述没生成"; exit 1; }
+      ACNH_SPEC=project_d3_free.yml
+    else
+      ACNH_SPEC=$SPEC_FILE
+    fi
+    rm -rf Gen
+    mkdir -p Gen/dm
+    for m in $MODS; do
+      [ -f "$OUT/$m.patched.bin" ] && [ -f "$OUT/$m.fixups.tsv" ] ||
+        { t "🔴 $LABEL 产物不全：$OUT/$m.{patched.bin,fixups.tsv}"; exit 1; }
+    done
+    nl=$(grep -rn 'listen(' Sources ../host --include='*.c' --include='*.m' | grep -v '^[^:]*:[0-9]*:\s*//' | wc -l | tr -d ' ')
+    gl=$(grep -c 'if (log_port && !pthread_create(&lp, NULL, log_port_main' Sources/main.m)
+    [ "$nl" = 1 ] && [ "$gl" = 1 ] ||
+      { t "🔴 端口监听核对失败：listen( 共 $nl 处（只许 1），开关守卫 $gl 处（须 1）"; exit 1; }
+    python3 tools/gen_build.py ../host Gen > Gen/dm.xcconfig || { t "🔴 gen_build 失败"; exit 1; }
+    F=$(python3 tools/gen_embed.py "$OUT" Gen/embed.S $MODS) || { t "🔴 gen_embed 失败"; exit 1; }
+    echo "OTHER_LDFLAGS = \$(inherited) \$(DM_FRAMEWORKS) $F" >> Gen/dm.xcconfig
+    for m in $MODS; do
+      cp "$OUT/$m.fixups.tsv" "$OUT/$m.gates.tsv" Gen/dm/
+      [ -f "$OUT/$m.cuts.tsv" ] && cp "$OUT/$m.cuts.tsv" Gen/dm/
+      [ -f "$OUT/$m.bootlist.tsv" ] && cp "$OUT/$m.bootlist.tsv" Gen/dm/
+    done
+    V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' ../gfx/nvn/dmsh_chain.h)
+    [ -s "$SHMAP" ] || { t "🔴 $LABEL shader 映射表不存在：$SHMAP"; exit 1; }
+    cp "$SHMAP" Gen/dm/shader_map.tsv
+    : > Gen/dm/pso_manifest.tsv
+    if [ "$GAME" = d3 ]; then MSL=${DM_D3_MSL_IOS:-}; else MSL=${DM_MSL_IOS:-$ROOT/acnh-ios-msl}; fi
+    [ -n "$MSL" ] || { t "🔴 D3 必须显式提供 DM_D3_MSL_IOS；禁止复用 D2R iOS shader 缓存"; exit 1; }
+    BMSL="$MSL/b-$V"
+    [ -d "$BMSL" ] && ls "$BMSL" | grep -q "_b.metallib$" ||
+      { t "🔴 缺 $LABEL iOS B 着色器：${BMSL}（先用 dmsh_build.py + IOSOUT 生成）"; exit 1; }
+    [ -f "$BMSL/c1_full.tsv" ] ||
+      { t "🔴 缺 $LABEL c1_full.tsv：$BMSL/c1_full.tsv（由 c1_guard.py 生成）"; exit 1; }
+    cp "$BMSL/c1_full.tsv" Gen/dm/c1_full.tsv
+    mkdir -p Gen/msl
+    cp -cR "$BMSL" Gen/msl/
+    t "生成 $LABEL 工程：模块 ${MODS}，RomFS 不进入安装包"
+    xcodegen generate -q --spec "$ACNH_SPEC" >/dev/null || { rm -f project_acnh_free.yml project_d3_free.yml; t "🔴 xcodegen 失败"; exit 1; }
+    rm -f project_acnh_free.yml project_d3_free.yml
+    [ "${DM_GEN_ONLY:-}" = 1 ] && { t "生成完成（DM_GEN_ONLY）"; exit 0; }
+    BN=$(git log -1 --format=%ct 2>/dev/null); [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ] && BN=1; BN=${BN:-1}
+    DEST='generic/platform=iOS'; SIGN=( )
+    if [ "${DM_NO_SIGN:-0}" = 1 ]; then
+      SIGN=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEVELOPMENT_TEAM=)
+      t "无签名编译：只验证工程、链接和资源布局，不生成可装机包"
+    else
+      asc_auth
+    fi
+    xcodebuild -project "$PROJECT.xcodeproj" -scheme DmIOS -configuration Release -destination "$DEST" \
+      -derivedDataPath "$DD" -allowProvisioningUpdates ${ASC_AUTH[@]+"${ASC_AUTH[@]}"} \
+      ${SIGN[@]+"${SIGN[@]}"} DM_BUILD_NUMBER=$BN \
+      ${DM_DEVICE_FAMILY:+DM_DEVICE_FAMILY=$DM_DEVICE_FAMILY} build > "$R/build_${GAME}.log" 2>&1 ||
+      { t "🔴 $LABEL 构建失败"; grep -E "error:" "$R/build_${GAME}.log" | head -8; exit 1; }
+    if [ "${DM_NO_SIGN:-0}" = 1 ]; then
+      t "$LABEL 无签名构建完成"
+      exit 0
+    fi
+    codesign -d --entitlements :- "$APP" 2>/dev/null | plutil -p -
+    t "$LABEL 签名构建完成"
+    exit 0
+  fi
   # 生成：宿主源文件/头路径/框架（取自 dm/host/Makefile）+ 映像三段内嵌汇编与 -segprot + 装载表头/门表进 App 资源 dm/
   # Generate: host source files/header paths/frameworks (taken from dm/host/Makefile) + embedded assembly for the three image segments and -segprot + load table header/gate table into the App resources dm/
   mkdir -p Gen; for x in Gen/* Gen/.[!.]*; do [ -e "$x" ] && [ "$x" != Gen/assets ] && rm -rf "$x"; done; mkdir -p Gen/dm   # 每次重建 Gen，但留着 Gen/assets：原版衍生资源有自己的输入指纹与锁（tools/gen_assets.py），删了会和并行读它的功能用例撞（accept 红） | Rebuild Gen every time but keep Gen/assets: assets derived from the original game have their own input fingerprint and lock (tools/gen_assets.py); deleting them would collide with functional cases reading them in parallel (accept fails)
@@ -47,7 +154,7 @@ if [ "$1" = build ]; then
   # Shaders: route B (translated from the Switch original) iOS <key>_b.metallib + <key>_b.json; if missing, the replay layer reports a failure and does not fall back.
   # To build: J=10 IOSOUT=<this directory> python3 ../gfx/tools/dmsh_build.py $DM_ROOT/build/cache/dm/dmsh <Mac cache dir> (compile settings in tools/ios_metal.py)
   # The host loads only from DM_MSL_DIR/b-<V>/ (V = the translation chain version in dm/gfx/nvn/dmsh_chain.h); inside the App it is placed as msl/b-<V>/, carrying only the current version
-  MSL=${DM_MSL_IOS:-${DM_ROOT:-$HOME/dm-work}/build/ios/dmsh_b}; V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' ../gfx/nvn/dmsh_chain.h)
+  MSL=${DM_MSL_IOS:-$ROOT/build/ios/dmsh_b}; V=$(sed -n 's/^#define DMSH_CHAIN "\(.*\)"/\1/p' ../gfx/nvn/dmsh_chain.h)
   [ -n "$V" ] && [ -d "$MSL/b-$V" ] && ls "$MSL/b-$V" | grep -q "_b.metallib$" || { t "🔴 缺 iOS 版 B 着色器 $MSL/b-${V}（见上一行出包命令；V=${V}）"; exit 1; }
   mkdir -p Gen/msl && cp -cR "$MSL/b-$V" Gen/msl/
   # 资源直接下载（直装包，Sources/asset_dl.m）：地址文件列表（仓库里的 asset_pointers.txt）+ 出包时的缺省下载根地址（DM_ASSET_BASE，tools/adhoc.sh 传隧道地址；没传就不带）
@@ -127,6 +234,7 @@ if [ "$1" = build ]; then
 fi
 if [ "$1" = install ]; then
   local_env_need DM_DEVICE || exit 1
+  [ -x "$APP/DmIOS" ] || { t "🔴 没有可安装的可执行产物：$APP（先完成签名构建）"; exit 1; }
   devlock_acquire "${SMOKE_OWNER:-${ACCEPT_OWNER:-run.sh install}}"
   trap devlock_release EXIT
   xcrun devicectl device install app --device $D "$APP" > $R/install.log 2>&1 || { t "🔴 装机失败"; tail -5 $R/install.log; exit 1; }

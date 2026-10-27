@@ -13,3 +13,4 @@ void dm_prof_add(int id, uint64_t ns, uint64_t bytes) { (void)id; (void)ns; (voi
 uint64_t now_ns(void) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); return mach_absolute_time() * tb.numer / tb.denom; }
 uint64_t guest_ns(void) { return now_ns(); }
 int dm_detclock_enabled(void) { return 0; }
+int dm_acnh_ipc_is_session(uint32_t handle) { (void)handle; return 0; }

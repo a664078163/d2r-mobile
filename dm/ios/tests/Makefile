@@ -3,6 +3,7 @@ CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic -O2
 TARGET = t_touch_controls
 METAL_CACHE_TARGET = t_metal_cache_guard
+PACK_TARGET = t_dm_pack
 BINDING_TARGETS = t_native_binding t_game_bridge t_binding_freshness t_portal_sequence t_binding_group t_native_hud_identity t_native_hud_bridge
 BINDING_FIXTURES = fixtures/native_binding/mapping.bin fixtures/native_binding/bindings.bin
 # 这两份夹具是从运行中的游戏内存抓下来的两张表，公开仓库不带（见 fixtures/native_binding/README）。不在就跳过要读它们的三个测试并说明，别的照跑
@@ -11,7 +12,7 @@ HAVE_BINDING_FIXTURES := $(and $(wildcard fixtures/native_binding/mapping.bin),$
 fixture_test = $(if $(HAVE_BINDING_FIXTURES),./$(1) $(BINDING_FIXTURES),@echo "跳过 $(1)：没有夹具 $(BINDING_FIXTURES)（公开仓库不带，要自己从运行中的游戏抓，见 fixtures/native_binding/README）")
 
 .PHONY: all run test clean
-all: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET)
+all: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(PACK_TARGET)
 run: test
 $(TARGET): t_touch_controls.c $(wildcard ../Sources/dm_touch_controls.[ch]) ../../host/dm_input.h
 	$(CC) $(CFLAGS) -I../Sources t_touch_controls.c ../Sources/dm_touch_controls.c -lm -o $@
@@ -42,8 +43,12 @@ t_joy_travel: t_joy_travel.c ../Sources/dm_touch_controls.c ../Sources/dm_touch_
 	$(CC) $(CFLAGS) -I../Sources t_joy_travel.c ../Sources/dm_touch_controls.c -lm -o $@
 t_metal_cache_guard: t_metal_cache_guard.c ../Sources/dm_metal_cache_guard.c ../Sources/dm_metal_cache_guard.h
 	$(CC) $(CFLAGS) -I../Sources t_metal_cache_guard.c ../Sources/dm_metal_cache_guard.c -o $@
-test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET)
+t_dm_pack: t_dm_pack.c ../Sources/dm_pack.c ../Sources/dm_pack.h
+	$(CC) $(CFLAGS) -I../Sources -c ../Sources/dm_pack.c -o t_dm_pack_main.o
+	$(CC) $(CFLAGS) -I../Sources t_dm_pack.c t_dm_pack_main.o -framework Foundation -lcompression -o $@
+test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(PACK_TARGET)
 	./$(METAL_CACHE_TARGET)
+	./$(PACK_TARGET)
 	./$(TARGET)
 	./t_skill_aim
 	./t_joy_travel
@@ -61,4 +66,4 @@ test: $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL
 	python3 test_skill_aim_front.py
 	python3 test_touch_receipt.py --source ../Sources/front_ios.m
 clean:
-	rm -f $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET)
+	rm -f $(TARGET) $(BINDING_TARGETS) t_native_art t_skill_aim t_joy_travel $(METAL_CACHE_TARGET) $(PACK_TARGET) t_dm_pack_*.o

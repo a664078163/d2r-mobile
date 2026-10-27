@@ -27,6 +27,9 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+#include <unistd.h>
+
+int dm_acnh_ipc_is_session(uint32_t handle);
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -64,6 +67,72 @@ static struct { int type; void *obj; } g_h[MAX_H];
 static pthread_key_t g_keythr;
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // 全部在等的线程（锁 / 条件 / 地址 / 同步） | All waiting threads (lock / condition / address / synchronization)
+
+// 临时 SVC 追踪不能在客体小栈上走 fprintf：格式化 I/O 会越过客体栈保护页，
+// 把诊断本身变成 SIGBUS。这里用固定小缓冲区手工编码后单次 write，采样后删除。
+// Temporary SVC tracing must not call fprintf on a guest's small stack: formatted I/O
+// can cross the guest stack guard page and turn the diagnostic itself into SIGBUS.
+// Encode into a small fixed buffer and write once; remove after sampling.
+static char *svc_trace_s(char *p, const char *s) { while (*s) *p++ = *s++; return p; }
+static char *svc_trace_hex(char *p, uint64_t v) {
+    static const char h[] = "0123456789abcdef";
+    char t[16]; int n = 0; *p++ = '0'; *p++ = 'x';
+    do { t[n++] = h[v & 15]; v >>= 4; } while (v);
+    while (n--) *p++ = t[n];
+    return p;
+}
+static char *svc_trace_dec(char *p, int v) {
+    char t[12]; int n = 0; unsigned x;
+    if (v < 0) { *p++ = '-'; x = (unsigned)(-(v + 1)) + 1u; } else x = (unsigned)v;
+    do { t[n++] = (char)('0' + x % 10); x /= 10; } while (x);
+    while (n--) *p++ = t[n];
+    return p;
+}
+static void svc_trace_before(uint32_t h, int num, const uint64_t *r) {
+    char b[256], *p = b;
+    p = svc_trace_s(p, "[dm] [SVC_TRACE] before h="); p = svc_trace_hex(p, h);
+    p = svc_trace_s(p, " svc="); p = svc_trace_hex(p, (uint32_t)num);
+    p = svc_trace_s(p, " x0="); p = svc_trace_hex(p, r[0]);
+    p = svc_trace_s(p, " x1="); p = svc_trace_hex(p, r[1]);
+    p = svc_trace_s(p, " x2="); p = svc_trace_hex(p, r[2]);
+    p = svc_trace_s(p, " x3="); p = svc_trace_hex(p, r[3]); *p++ = '\n';
+    (void)write(STDERR_FILENO, b, (size_t)(p - b));
+}
+static void svc_trace_one(const char *kind, uint32_t a, const char *tail, int v) {
+    char b[160], *p = b;
+    p = svc_trace_s(p, "[dm] [SVC_TRACE] "); p = svc_trace_s(p, kind);
+    p = svc_trace_s(p, " h="); p = svc_trace_hex(p, a);
+    if (tail) p = svc_trace_s(p, tail);
+    if (v >= 0) { p = svc_trace_s(p, " -> "); p = svc_trace_s(p, v ? "bad" : "ok"); }
+    *p++ = '\n'; (void)write(STDERR_FILENO, b, (size_t)(p - b));
+}
+static void svc_trace_wait(uint64_t key, uint64_t lock, uint32_t tag, uint32_t lock_now, uint32_t key_now) {
+    char b[256], *p = b;
+    p = svc_trace_s(p, "[dm] [SVC_TRACE] WaitProcessWideKeyAtomic key="); p = svc_trace_hex(p, key);
+    p = svc_trace_s(p, " lock="); p = svc_trace_hex(p, lock);
+    p = svc_trace_s(p, " tag="); p = svc_trace_hex(p, tag);
+    p = svc_trace_s(p, " lock_now="); p = svc_trace_hex(p, lock_now);
+    p = svc_trace_s(p, " key_now="); p = svc_trace_hex(p, key_now); *p++ = '\n';
+    (void)write(STDERR_FILENO, b, (size_t)(p - b));
+}
+static void svc_trace_signal(const char *kind, uint64_t key, int cnt, int waiters, uint32_t first, uint32_t lock) {
+    char b[256], *p = b;
+    p = svc_trace_s(p, "[dm] [SVC_TRACE] "); p = svc_trace_s(p, kind);
+    p = svc_trace_s(p, " key="); p = svc_trace_hex(p, key);
+    p = svc_trace_s(p, " cnt="); p = svc_trace_dec(p, cnt);
+    p = svc_trace_s(p, " waiters="); p = svc_trace_dec(p, waiters);
+    p = svc_trace_s(p, " first="); p = svc_trace_hex(p, first);
+    p = svc_trace_s(p, " lock="); p = svc_trace_hex(p, lock); *p++ = '\n';
+    (void)write(STDERR_FILENO, b, (size_t)(p - b));
+}
+static void svc_trace_signal_done(uint64_t key, int woke, int left, uint32_t key_now) {
+    char b[192], *p = b;
+    p = svc_trace_s(p, "[dm] [SVC_TRACE] SignalProcessWideKey done key="); p = svc_trace_hex(p, key);
+    p = svc_trace_s(p, " woke="); p = svc_trace_dec(p, woke);
+    p = svc_trace_s(p, " left="); p = svc_trace_dec(p, left);
+    p = svc_trace_s(p, " key_now="); p = svc_trace_hex(p, key_now); *p++ = '\n';
+    (void)write(STDERR_FILENO, b, (size_t)(p - b));
+}
 
 static uint32_t h_new(int type, void *obj) {     // 调用方持 G | Caller holds G
     for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
@@ -438,6 +507,10 @@ void svc_thread_dump(void) {
 int svc_thread(int num, uint64_t *regs) {
     { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }
     if (g_flag.thr && num != 0x0B) { thr_t *me = pthread_getspecific(g_keythr); LOG("[%#x] svc %#x x0=%#llx x1=%#llx x2=%#llx x3=%#llx", me ? me->handle : 0, num, regs[0], regs[1], regs[2], regs[3]); }
+    if (g_flag.svc_trace && (num == 0x08 || num == 0x09 || num == 0x1C || num == 0x1D)) {
+        thr_t *me = pthread_getspecific(g_keythr);
+        svc_trace_before(me ? me->handle : 0, num, regs);
+    }
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
         thr_t *t = calloc(1, sizeof *t);
@@ -451,6 +524,7 @@ int svc_thread(int num, uint64_t *regs) {
         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
         pthread_attr_destroy(&a);
         if (g_flag.thr) LOG("CreateThread h=%#x entry=%#llx arg=%#llx sp=%#llx prio=%d core=%d", t->handle, t->entry, t->arg, t->stack_top, t->prio, t->core);
+        if (g_flag.svc_trace) svc_trace_one("CreateThread ->", t->handle, NULL, -1);
         regs[0] = 0; regs[1] = t->handle; return 1;
     }
     case 0x09: {  // StartThread(w0)
@@ -458,6 +532,7 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
         if (t) { t->started = 1; pthread_cond_signal(&t->cv); }
         pthread_mutex_unlock(&G);
+        if (g_flag.svc_trace) svc_trace_one("StartThread", (unsigned)regs[0], NULL, t ? 0 : 1);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
     case 0x0A: thread_exit(cur()); return 1;
@@ -522,6 +597,7 @@ int svc_thread(int num, uint64_t *regs) {
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
+        if (g_flag.svc_trace) svc_trace_wait(key, addr, (unsigned)regs[2], ld32(addr), ld32(key));
         int64_t r = block(t, 2, (int64_t)regs[3]);   // 超时：不重新拿锁（用户态自己拿） | Timeout: the lock is not re-acquired (user mode takes it itself)
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
@@ -529,9 +605,16 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x1D: {  // SignalProcessWideKey(x0 条件键, w1 个数，<=0 全部) | SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
         pthread_mutex_lock(&G);
+        if (g_flag.svc_trace) {
+            int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) nw++;
+            thr_t *first = pick(2, key);
+            svc_trace_signal("SignalProcessWideKey", key, cnt, nw, first ? first->handle : 0,
+                             first ? ld32(first->waddr) : 0);
+        }
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
+        if (g_flag.svc_trace) svc_trace_signal_done(key, n, left, ld32(key));
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
     }
@@ -615,6 +698,7 @@ int svc_thread(int num, uint64_t *regs) {
     }
     case 0x16: {  // CloseHandle(w0)：事件两端都关才释放；线程句柄关闭后槽位回收，对象在线程也退出后释放 | CloseHandle(w0): an event is freed only when both ends are closed; after a thread handle is closed the slot is recycled, and the object is freed once the thread has also exited
         pthread_mutex_lock(&G);
+        if (dm_acnh_ipc_is_session((uint32_t)regs[0])) { regs[0] = 0; return 1; }
         unsigned i = (uint32_t)regs[0] - 0x1000;
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
             event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
@@ -638,6 +722,31 @@ int svc_thread(int num, uint64_t *regs) {
 // ---------- SystemEvent of the service layer ----------
 // Real device: the service hands the read end of a kernel event to the client, and the guest waits on it through SDK nn::os. Host: on a guest thread, call the SDK's own
 // CreateSystemEvent(inter-process=true), and the SDK creates the kernel event through SVC 0x45; the write-end handle is recorded, after which any thread (including the host audio thread) can signal it.
+uint32_t dm_service_event_create(int signaled, uint32_t *write_handle) {
+    event_t *e = calloc(1, sizeof *e);
+    if (!e) die("服务事件分配失败");
+    e->refs = 2;
+    e->signaled = !!signaled;
+    pthread_mutex_lock(&G);
+    uint32_t wh = h_new(O_EVENT_W, e), rh = h_new(O_EVENT_R, e);
+    pthread_mutex_unlock(&G);
+    if (write_handle) *write_handle = wh;
+    return rh;
+}
+
+void dm_service_event_signal(uint32_t write_handle) {
+    pthread_mutex_lock(&G);
+    event_t *e = h_peek(write_handle, O_EVENT_W);
+    if (!e) {
+        pthread_mutex_unlock(&G);
+        LOG("服务事件写端无效 %#x", write_handle);
+        return;
+    }
+    e->signaled = 1;
+    wake_sync_waiters();
+    pthread_mutex_unlock(&G);
+}
+
 static struct { void *ev; uint32_t wh; } g_se[512];
 static int g_nse;
 static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;

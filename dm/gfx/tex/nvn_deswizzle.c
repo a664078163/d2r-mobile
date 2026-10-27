@@ -32,7 +32,7 @@ static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
 // Geometry of this level: width-in-blocks byte count, block row count, slice count, and where this level and layer starts in storage; returns -1 for unsupported textures
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices, uint64_t *base, unsigned *th, unsigned *td, uint32_t *bpb) {
-    if (d->target == 5 || d->target == 6 || d->target == 10 || (d->flags & 0x10) || d->samples > 1) return -1;   // MS / BUFFER / LINEAR
+    if (d->target == 5 || d->target == 6 || d->target == 10 || d->samples > 1) return -1;   // MS / BUFFER
     int bw, bh; *bpb = (uint32_t)nvn_fmt_bpb(d->format, &bw, &bh);
     if (!*bpb || level >= (d->levels ? d->levels : 1)) return -1;
     nvn_texlayout L; nvn_tex_layout(d, &L);
@@ -51,6 +51,12 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
     if (pitch < row_bytes) return -1;
     bl += base;
+    if (d->flags & 0x10) {
+        size_t storage_pitch = nvn_tex_level_stride(d, level), storage_slice = storage_pitch * rows;
+        for (uint32_t z = 0; z < slices; z++) for (uint32_t y = 0; y < rows; y++)
+            memcpy(lin + ((size_t)z * rows + y) * pitch, bl + (size_t)z * storage_slice + (size_t)y * storage_pitch, row_bytes);
+        return 0;
+    }
     for (uint32_t z = 0; z < slices; z++)
         for (uint32_t y = 0; y < rows; y++) {
             uint8_t *row = lin + ((size_t)z * rows + y) * pitch;
@@ -68,4 +74,46 @@ int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const vo
 }
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
     return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0);
+}
+
+int nvn_write_texels(const nvn_texdesc *d, unsigned level, unsigned layer,
+                     const NVNcopyRegion *r, const void *src,
+                     size_t row_stride, size_t image_stride, void *dst_storage) {
+    if (!d || !r || !src || !dst_storage || r->xoffset < 0 || r->yoffset < 0 || r->zoffset < 0 ||
+        r->width <= 0 || r->height <= 0 || r->depth <= 0) return -1;
+    int bw, bh, bpb = nvn_fmt_bpb(d->format, &bw, &bh); if (!bpb) return -1;
+    uint32_t full_rb, full_rows, full_slices, full_bpb; uint64_t unused; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, d->target == 2 ? 0 : layer, &full_rb, &full_rows, &full_slices, &unused, &th, &td, &full_bpb)) return -1;
+    if (r->xoffset % bw || r->yoffset % bh || (r->width % bw && r->xoffset + r->width != (int)(full_rb / bpb * bw)) ||
+        (r->height % bh && r->yoffset + r->height != (int)(full_rows * bh))) return -1;
+    uint32_t rw = ((uint32_t)r->width + bw - 1) / bw, rh = ((uint32_t)r->height + bh - 1) / bh;
+    size_t packed = (size_t)rw * bpb, row = row_stride ? row_stride : packed;
+    size_t image = image_stride ? image_stride : row * rh;
+    if (row < packed || image < row * rh) return -1;
+    int is3d = d->target == 2; uint32_t nz = (uint32_t)r->depth;
+    nvn_texlayout L; nvn_tex_layout(d, &L);
+    if (!is3d && (uint32_t)layer + (uint32_t)r->zoffset + nz > L.layers) return -1;
+    for (uint32_t zi = 0; zi < nz; zi++) {
+        unsigned dst_layer = is3d ? 0 : layer + (unsigned)r->zoffset + zi;
+        uint32_t dst_z = is3d ? (uint32_t)r->zoffset + zi : 0;
+        uint64_t base; unsigned lth, ltd; uint32_t rb, rows, slices, lbpb;
+        if (nvn_deswizzle_geom(d, level, dst_layer, &rb, &rows, &slices, &base, &lth, &ltd, &lbpb)) return -1;
+        uint8_t *dst = (uint8_t *)dst_storage + base;
+        const uint8_t *sp = (const uint8_t *)src + (size_t)zi * image;
+        for (uint32_t y = 0; y < rh; y++) {
+            uint32_t sy = (uint32_t)r->yoffset / bh + y;
+            const uint8_t *srow = sp + (size_t)y * row;
+            if (d->flags & 0x10) {
+                size_t pitch = nvn_tex_level_stride(d, level);
+                memcpy(dst + (size_t)sy * pitch + (size_t)(r->xoffset / bw) * bpb, srow, packed);
+            } else {
+                uint32_t x0 = (uint32_t)r->xoffset / bw * bpb;
+                for (uint32_t x = 0; x < packed;) {
+                    uint32_t xb = x0 + x; size_t n = 16 - (xb & 15); if (n > packed - x) n = packed - x;
+                    memcpy(dst + nvn_bl_offset(xb, sy, dst_z, rb, rows, lth, ltd), srow + x, n); x += (uint32_t)n;
+                }
+            }
+        }
+    }
+    return 0;
 }
